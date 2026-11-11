@@ -1,3 +1,4 @@
+#include <cstdlib> // PORT: strtol, free (not pulled in by other headers with libc++)
 #include "ship/utils/StringHelper.h"
 
 #if (_MSC_VER)

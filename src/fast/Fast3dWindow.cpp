@@ -11,6 +11,7 @@
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
 #include "fast/backends/gfx_metal.h"
+#include "fast/backends/gfx_vulkan.h"
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
@@ -160,6 +161,14 @@ uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
 }
 
 void Fast3dWindow::InitWindowManager() {
+#ifdef ENABLE_VULKAN
+    // PORT: Vulkan is used only when the config asks for it (Window.Backend.Id 4) and a driver with a device is
+    // installed; otherwise the default backend. Probed only then: the probe (SDL video + a Vulkan instance before the
+    // window exists) stalled the OpenGL backend on macOS.
+    if (GetConfig()->GetInt("Window.Backend.Id", -1) == WindowBackend::FAST3D_SDL_VULKAN && Vulkan_IsSupported()) {
+        AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_VULKAN);
+    }
+#endif
     SetWindowBackend(GetSavedWindowBackend());
 
     switch (GetWindowBackend()) {
@@ -189,6 +198,15 @@ void Fast3dWindow::InitWindowManager() {
                                         GetConsoleVariables(), std::dynamic_pointer_cast<Fast::Fast3dGui>(GetGui()));
             mRenderingApi = new GfxRenderingAPIMetal(GetConsoleVariables(),
                                                      GetContext()->GetChildren().GetFirst<Ship::ResourceManager>());
+            break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            mWindowManagerApi =
+                new GfxWindowBackendSDL(GetConfig(), GetContext()->GetChildren().GetFirst<Ship::FileDrop>(),
+                                        GetConsoleVariables(), std::dynamic_pointer_cast<Fast::Fast3dGui>(GetGui()));
+            mRenderingApi = new GfxRenderingAPIVK(GetConsoleVariables(),
+                                                  GetContext()->GetChildren().GetFirst<Ship::ResourceManager>());
             break;
 #endif
         default:
@@ -226,13 +244,19 @@ void Fast3dWindow::EndFrame() {
 }
 
 bool Fast3dWindow::IsFrameReady() {
-    return mWindowManagerApi->IsFrameReady();
+    // PORT: never drop a frame. N64 frame buffers keep their picture and the game draws some things only once (menu
+    // panels), so a frame dropped by the DXGI backend's wall-clock pacing lost them for good on a slow host.
+    static const bool sAllowDrop = getenv("PORT_ALLOW_FRAME_DROP") != nullptr;
+    return !sAllowDrop || mWindowManagerApi->IsFrameReady();
 }
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     // Skip dropped frames
     if (!IsFrameReady()) {
-        return false;
+        // PORT: a dropped frame still updates the persistent RSP/RDP state; one that renders to a texture is drawn
+        if (!mInterpreter->TrackSegmentsOnly(commands)) {
+            return false;
+        }
     }
 
     auto gui = GetGui();
@@ -463,6 +487,10 @@ std::string Fast3dWindow::GetWindowBackendName() {
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
             return "Metal";
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            return "Vulkan";
 #endif
         default:
             return "";

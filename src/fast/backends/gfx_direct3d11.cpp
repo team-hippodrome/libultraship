@@ -6,6 +6,7 @@
 
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <windows.h>
 #include <versionhelpers.h>
@@ -31,6 +32,7 @@
 #include "ship/config/ConsoleVariable.h"
 
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/backends/resize_keep.h"
 #include "fast/interpreter.h"
 
 #include <prism/processor.h>
@@ -196,6 +198,10 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
 };
 
 void GfxRenderingAPIDX11::Init() {
+    mShaderCache.Open("d3d11");
+    mDepthStencilStates.clear();
+    mRasterizerStates.clear();
+    mVertexRingOffset = kVertexRingSize;
     // Load d3d11.dll
     mDX11Module = LoadLibraryW(L"d3d11.dll");
     if (mDX11Module == nullptr) {
@@ -263,7 +269,7 @@ void GfxRenderingAPIDX11::Init() {
     ZeroMemory(&vertex_buffer_desc, sizeof(D3D11_BUFFER_DESC));
 
     vertex_buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-    vertex_buffer_desc.ByteWidth = 256 * 32 * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+    vertex_buffer_desc.ByteWidth = kVertexRingSize;
     vertex_buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vertex_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     vertex_buffer_desc.MiscFlags = 0;
@@ -391,52 +397,54 @@ void GfxRenderingAPIDX11::ClearShaderCache() {
     mShaderProgramPool.clear();
 }
 
+std::vector<char> GfxRenderingAPIDX11::CompileShader(const std::string& source, const char* entry,
+                                                     const char* target, UINT flags, bool useCache) {
+    const auto options = std::to_string(flags);
+    const uint64_t key = ShaderDiskCache::Hash({source, entry, target, options, "d3dcompiler47-v1"});
+    if (useCache) {
+        auto data = mShaderCache.Load(key);
+        if (!data.empty()) return data;
+    }
+    ComPtr<ID3DBlob> code, error;
+    const HRESULT hr = mD3dCompile(source.data(), source.size(), nullptr, nullptr, nullptr, entry, target,
+                                    flags, 0, code.GetAddressOf(), error.GetAddressOf());
+    if (FAILED(hr)) {
+        const char* message = error ? static_cast<const char*>(error->GetBufferPointer()) : "Shader compilation failed";
+        MessageBoxA(mWindowBackend->GetWindowHandle(), message, "Error", MB_OK | MB_ICONERROR);
+        throw Ship::HResultException(hr, "Shader compilation failed");
+    }
+    const auto* bytes = static_cast<const char*>(code->GetBufferPointer());
+    std::vector<char> data(bytes, bytes + code->GetBufferSize());
+    mShaderCache.Store(key, data.data(), data.size());
+    return data;
+}
+
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
-    char* buf;
-    size_t len, numFloats;
-
-    auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
-
-    buf = shader.data();
-    len = shader.size();
-
-    ComPtr<ID3DBlob> vs, ps;
-    ComPtr<ID3DBlob> error_blob;
-
+    size_t numFloats;
+    const auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
+                                                        mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
 #if DEBUG_D3D
     UINT compile_flags = D3DCOMPILE_DEBUG;
 #else
     UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
-
-    HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
-                             vs.GetAddressOf(), error_blob.GetAddressOf());
-
+    auto vs = CompileShader(shader, "VSMain", "vs_4_0", compile_flags);
+    auto ps = CompileShader(shader, "PSMain", "ps_4_0", compile_flags);
+    auto* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
+    // Drivers can reject cached bytecode after an update. Recompile it once.
+    HRESULT hr = mDevice->CreateVertexShader(vs.data(), vs.size(), nullptr, prg->vertex_shader.GetAddressOf());
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Vertex shader compilation failed");
+        vs = CompileShader(shader, "VSMain", "vs_4_0", compile_flags, false);
+        ThrowIfFailed(mDevice->CreateVertexShader(vs.data(), vs.size(), nullptr, prg->vertex_shader.ReleaseAndGetAddressOf()));
     }
-
-    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
-                     error_blob.GetAddressOf());
-
+    hr = mDevice->CreatePixelShader(ps.data(), ps.size(), nullptr, prg->pixel_shader.GetAddressOf());
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Pixel shader compilation failed");
+        ps = CompileShader(shader, "PSMain", "ps_4_0", compile_flags, false);
+        ThrowIfFailed(mDevice->CreatePixelShader(ps.data(), ps.size(), nullptr, prg->pixel_shader.ReleaseAndGetAddressOf()));
     }
-
-    struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
-
-    ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
-                                              prg->vertex_shader.GetAddressOf()));
-    ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
-                                             prg->pixel_shader.GetAddressOf()));
 
     // Input Layout
 
@@ -489,7 +497,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     }
 
-    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs->GetBufferPointer(), vs->GetBufferSize(),
+    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs.data(), vs.size(),
                                              prg->input_layout.GetAddressOf()));
 
     // Blend state
@@ -499,12 +507,13 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     if (cc_features.opt_alpha) {
         blend_desc.RenderTarget[0].BlendEnable = true;
-        blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-        blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        // PORT: dual-source, as gfx_metal.cpp: RGB = src * a + dst * (1 - a) with a = the shader's second output's
+        // alpha; alpha = coverage (the first output's alpha: 1, or 0 for o_invisible draws, which keep the old alpha)
+        blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC1_ALPHA;
+        blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC1_ALPHA;
         blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
-        blend_desc.RenderTarget[0].DestBlendAlpha =
-            D3D11_BLEND_ONE; // We initially clear alpha to 1.0f and want to keep it at 1.0f
+        blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
         blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     } else {
@@ -673,31 +682,34 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
-    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
+    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask ||
+        mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
 
-        mDepthStencilState.Reset();
+        const uint32_t key = (mCurrentDepthTest ? 1 : 0) | (mCurrentDepthMask ? 2 : 0) |
+                             (mCurrentZmodeDecal ? 4 : 0);
+        auto& state = mDepthStencilStates[key];
+        if (state == nullptr) {
+            D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
+            ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
 
-        D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
-        ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
+            depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
+            depth_stencil_desc.DepthWriteMask =
+                mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+            depth_stencil_desc.DepthFunc = mCurrentDepthTest
+                                               ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
+                                               : D3D11_COMPARISON_ALWAYS;
+            depth_stencil_desc.StencilEnable = false;
 
-        depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
-        depth_stencil_desc.DepthWriteMask =
-            mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-        depth_stencil_desc.DepthFunc = mCurrentDepthTest
-                                           ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
-                                           : D3D11_COMPARISON_ALWAYS;
-        depth_stencil_desc.StencilEnable = false;
-
-        ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
+            ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, state.GetAddressOf()));
+        }
+        mDepthStencilState = state;
         mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
     }
 
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
-
-        mRasterizerState.Reset();
 
         D3D11_RASTERIZER_DESC rasterizer_desc;
         ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
@@ -730,7 +742,13 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         rasterizer_desc.MultisampleEnable = false;
         rasterizer_desc.AntialiasedLineEnable = false;
 
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
+        uint32_t key;
+        memcpy(&key, &rasterizer_desc.SlopeScaledDepthBias, sizeof(key));
+        auto& state = mRasterizerStates[key];
+        if (state == nullptr) {
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, state.GetAddressOf()));
+        }
+        mRasterizerState = state;
         mContext->RSSetState(mRasterizerState.Get());
     }
 
@@ -755,11 +773,11 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                     textures_changed = true;
                 }
 
-                if (mLastSamplerStates[i].Get() != mTextures[mCurrentTextureIds[i]].sampler_state.Get()) {
-                    mLastSamplerStates[i] = mTextures[mCurrentTextureIds[i]].sampler_state.Get();
-                }
             }
-            mContext->PSSetSamplers(i, 1, mTextures[mCurrentTextureIds[i]].sampler_state.GetAddressOf());
+            if (mLastSamplerStates[i].Get() != mTextures[mCurrentTextureIds[i]].sampler_state.Get()) {
+                mLastSamplerStates[i] = mTextures[mCurrentTextureIds[i]].sampler_state.Get();
+                mContext->PSSetSamplers(i, 1, mTextures[mCurrentTextureIds[i]].sampler_state.GetAddressOf());
+            }
         }
     }
 
@@ -783,16 +801,21 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mPrimDepthDirty = false;
     }
 
-    // Set vertex buffer data
-
-    D3D11_MAPPED_SUBRESOURCE ms;
-    ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-    mContext->Map(mVertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, buf_vbo, buf_vbo_len * sizeof(float));
-    mContext->Unmap(mVertexBuffer.Get(), 0);
-
-    uint32_t stride = mShaderProgram->numFloats * sizeof(float);
+    // Append without overwriting vertices still in use by earlier draws.
+    const uint32_t stride = mShaderProgram->numFloats * sizeof(float);
     uint32_t offset = 0;
+    const size_t bytes = buf_vbo_len * sizeof(float);
+    size_t start = (mVertexRingOffset + stride - 1) / stride * stride;
+    D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (start + bytes > kVertexRingSize) {
+        start = 0;
+        mapType = D3D11_MAP_WRITE_DISCARD;
+    }
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    ThrowIfFailed(mContext->Map(mVertexBuffer.Get(), 0, mapType, 0, &ms));
+    memcpy(static_cast<char*>(ms.pData) + start, buf_vbo, bytes);
+    mContext->Unmap(mVertexBuffer.Get(), 0);
+    mVertexRingOffset = start + bytes;
 
     if (mLastVertexBufferStride != stride) {
         mLastVertexBufferStride = stride;
@@ -816,7 +839,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
 
-    mContext->Draw(buf_vbo_num_tris * 3, 0);
+    mContext->Draw(buf_vbo_num_tris * 3, static_cast<UINT>(start / stride));
 }
 
 void GfxRenderingAPIDX11::OnResize() {
@@ -860,6 +883,129 @@ int GfxRenderingAPIDX11::CreateFramebuffer() {
     return (int)index;
 }
 
+// PORT: framebuffers whose colour texture was just (re)created have undefined contents; the first pass into one clears
+// it to black, as an untouched N64 frame buffer would read (see gfx_metal.cpp)
+static std::unordered_set<int> sFreshColorFbs;
+
+// PORT: the old picture drawn into a resized framebuffer's new render target (fast/backends/resize_keep.h): a quad
+// over the destination rectangle (the viewport) samples the old texture. The device context state it changes is saved
+// and restored, so the backend's own state caches stay valid.
+static bool DrawOldPictureScaled(ID3D11Device* device, ID3D11DeviceContext* ctx, pD3DCompile compile,
+                                 ID3D11ShaderResourceView* oldSrv, uint32_t ow, uint32_t oh, ID3D11RenderTargetView* rtv,
+                                 uint32_t nw, uint32_t nh) {
+    static ComPtr<ID3D11VertexShader> sVs;
+    static ComPtr<ID3D11PixelShader> sPs;
+    static ComPtr<ID3D11SamplerState> sSampler;
+    static ComPtr<ID3D11RasterizerState> sRaster;
+    static bool sFailed = false;
+    if (sFailed || compile == nullptr) {
+        return false;
+    }
+    if (sVs.Get() == nullptr) {
+        static const char source[] = R"(
+            struct VO { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+            VO VSMain(uint id : SV_VertexID) {
+                float2 c = float2(id & 1, id >> 1);
+                VO o;
+                o.pos = float4(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0);
+                o.uv = c;
+                return o;
+            }
+            Texture2D src : register(t0);
+            SamplerState linearSampler : register(s0);
+            float4 PSMain(VO i) : SV_Target { return src.Sample(linearSampler, i.uv); }
+        )";
+        ComPtr<ID3DBlob> vs, ps, err;
+        if (FAILED(compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", 0, 0,
+                           vs.GetAddressOf(), err.ReleaseAndGetAddressOf())) ||
+            FAILED(compile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", 0, 0,
+                           ps.GetAddressOf(), err.ReleaseAndGetAddressOf())) ||
+            FAILED(device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, sVs.GetAddressOf())) ||
+            FAILED(device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, sPs.GetAddressOf()))) {
+            sFailed = true;
+            return false;
+        }
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = TRUE;
+        if (FAILED(device->CreateSamplerState(&sd, sSampler.GetAddressOf())) ||
+            FAILED(device->CreateRasterizerState(&rd, sRaster.GetAddressOf()))) {
+            sFailed = true;
+            return false;
+        }
+    }
+
+    // save
+    ComPtr<ID3D11InputLayout> layout;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    ComPtr<ID3D11VertexShader> vsOld;
+    ComPtr<ID3D11PixelShader> psOld;
+    ComPtr<ID3D11ShaderResourceView> srvOld;
+    ComPtr<ID3D11SamplerState> samplerOld;
+    ComPtr<ID3D11BlendState> blendOld;
+    FLOAT blendFactor[4];
+    UINT sampleMask;
+    ComPtr<ID3D11DepthStencilState> dssOld;
+    UINT stencilRef;
+    ComPtr<ID3D11RasterizerState> rasterOld;
+    UINT viewportCount = 1;
+    D3D11_VIEWPORT viewportOld = {};
+    ComPtr<ID3D11RenderTargetView> rtvOld;
+    ComPtr<ID3D11DepthStencilView> dsvOld;
+    ctx->IAGetInputLayout(layout.GetAddressOf());
+    ctx->IAGetPrimitiveTopology(&topology);
+    ctx->VSGetShader(vsOld.GetAddressOf(), nullptr, nullptr);
+    ctx->PSGetShader(psOld.GetAddressOf(), nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 1, srvOld.GetAddressOf());
+    ctx->PSGetSamplers(0, 1, samplerOld.GetAddressOf());
+    ctx->OMGetBlendState(blendOld.GetAddressOf(), blendFactor, &sampleMask);
+    ctx->OMGetDepthStencilState(dssOld.GetAddressOf(), &stencilRef);
+    ctx->RSGetState(rasterOld.GetAddressOf());
+    ctx->RSGetViewports(&viewportCount, &viewportOld);
+    ctx->OMGetRenderTargets(1, rtvOld.GetAddressOf(), dsvOld.GetAddressOf());
+
+    // draw
+    const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    ctx->ClearRenderTargetView(rtv, black);
+    PortResizeKeepRect r = PortResizeKeepDest((float)ow, (float)oh, (float)nw, (float)nh);
+    D3D11_VIEWPORT vp = { r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, 0.0f, 1.0f };
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx->VSSetShader(sVs.Get(), nullptr, 0);
+    ctx->PSSetShader(sPs.Get(), nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &oldSrv);
+    ctx->PSSetSamplers(0, 1, sSampler.GetAddressOf());
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(sRaster.Get());
+    ctx->RSSetViewports(1, &vp);
+    ctx->Draw(4, 0);
+
+    // restore
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    ctx->PSSetShaderResources(0, 1, &noSrv); // the old texture goes away now
+    ctx->IASetInputLayout(layout.Get());
+    ctx->IASetPrimitiveTopology(topology);
+    ctx->VSSetShader(vsOld.Get(), nullptr, 0);
+    ctx->PSSetShader(psOld.Get(), nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, srvOld.GetAddressOf());
+    ctx->PSSetSamplers(0, 1, samplerOld.GetAddressOf());
+    ctx->OMSetBlendState(blendOld.Get(), blendFactor, sampleMask);
+    ctx->OMSetDepthStencilState(dssOld.Get(), stencilRef);
+    ctx->RSSetState(rasterOld.Get());
+    if (viewportCount > 0) {
+        ctx->RSSetViewports(1, &viewportOld);
+    }
+    ctx->OMSetRenderTargets(1, rtvOld.GetAddressOf(), dsvOld.Get());
+    return true;
+}
+
 void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                       bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                       bool can_extract_depth) {
@@ -892,11 +1038,36 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
             texture_desc.SampleDesc.Count = msaa_level;
             texture_desc.SampleDesc.Quality = 0;
 
+            // PORT: the old picture survives the resize (DrawOldPictureScaled): its texture and view are kept until
+            // the new render target exists (only a single-sample old texture can be sampled)
+            ComPtr<ID3D11Texture2D> oldTexture;
+            ComPtr<ID3D11ShaderResourceView> oldView;
+            const uint32_t ow = tex.width, oh = tex.height;
+            if (render_target && PortResizeKeepEnabled() && fb.render_target_view.Get() != nullptr &&
+                fb.msaa_level <= 1 && tex.resource_view.Get() != nullptr && ow > 1 && oh > 1 &&
+                (ow != width || oh != height)) {
+                oldTexture = tex.texture;
+                oldView = tex.resource_view;
+            }
+
             ThrowIfFailed(mDevice->CreateTexture2D(&texture_desc, nullptr, tex.texture.ReleaseAndGetAddressOf()));
+            if (render_target && oldView.Get() == nullptr) {
+                sFreshColorFbs.insert(fb_id);
+            }
 
             if (msaa_level <= 1) {
                 ThrowIfFailed(mDevice->CreateShaderResourceView(tex.texture.Get(), nullptr,
                                                                 tex.resource_view.ReleaseAndGetAddressOf()));
+            }
+            if (oldView.Get() != nullptr) {
+                ThrowIfFailed(mDevice->CreateRenderTargetView(tex.texture.Get(), nullptr,
+                                                              fb.render_target_view.ReleaseAndGetAddressOf()));
+                if (DrawOldPictureScaled(mDevice.Get(), mContext.Get(), mD3dCompile, oldView.Get(), ow, oh,
+                                         fb.render_target_view.Get(), width, height)) {
+                    sFreshColorFbs.erase(fb_id);
+                } else {
+                    sFreshColorFbs.insert(fb_id);
+                }
             }
         } else if (diff || (render_target && tex.texture.Get() == nullptr)) {
             DXGI_SWAP_CHAIN_DESC1 desc1;
@@ -952,6 +1123,21 @@ void GfxRenderingAPIDX11::StartDrawToFramebuffer(int fb_id, float noise_scale) {
     mContext->Map(mPerFrameCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     memcpy(ms.pData, &mPerFrameCbData, sizeof(PerFrameCB));
     mContext->Unmap(mPerFrameCb.Get(), 0);
+
+    static const bool sNoFreshClear = getenv("PORT_NO_FRESH_CLEAR") != nullptr; // debug: old behaviour
+    if (sFreshColorFbs.erase(fb_id) != 0 && !sNoFreshClear && fb.render_target_view) {
+        ClearFramebuffer(true, false);
+    }
+}
+
+bool GfxRenderingAPIDX11::ClearFramebufferColor(float r, float g, float b, float a) {
+    FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];
+    if (mCurrentFramebuffer == 0 || !fb.render_target_view) {
+        return false;
+    }
+    const float clearColor[] = { r, g, b, a };
+    mContext->ClearRenderTargetView(fb.render_target_view.Get(), clearColor);
+    return true;
 }
 
 void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
@@ -980,6 +1166,26 @@ void* GfxRenderingAPIDX11::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIDX11::SelectTextureFb(int fbID) {
     int tile = 0;
     SelectTexture(tile, mFrameBuffers[fbID].texture_id);
+}
+
+// PORT: frame interpolation copies a game frame buffer away and back (immediate context: in order). Two multisampled
+// framebuffers of the same size and sample count are copied as they are (CopyFramebuffer would resolve the source).
+void GfxRenderingAPIDX11::CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) {
+    if (dstFb >= (int)mFrameBuffers.size() || srcFb >= (int)mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& dst = mFrameBuffers[dstFb];
+    FramebufferDX11& src = mFrameBuffers[srcFb];
+    TextureData& tdDst = mTextures[dst.texture_id];
+    TextureData& tdSrc = mTextures[src.texture_id];
+    if (src.msaa_level > 1 || dst.msaa_level > 1) {
+        if (src.msaa_level == dst.msaa_level && tdSrc.width == tdDst.width && tdSrc.height == tdDst.height &&
+            tdSrc.texture && tdDst.texture) {
+            mContext->CopyResource(tdDst.texture.Get(), tdSrc.texture.Get());
+        }
+        return;
+    }
+    CopyFramebuffer(dstFb, srcFb, 0, 0, w, h, 0, 0, w, h);
 }
 
 void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -1051,6 +1257,14 @@ void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX
     }
 }
 
+extern std::vector<uint8_t> gPortScreenBgra; // interpreter.cpp
+extern uint32_t gPortScreenW, gPortScreenH;
+
+void GfxRenderingAPIDX11::InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) {
+    auto& texture = mTextures[mFrameBuffers.at(fbId).texture_id];
+    mContext->UpdateSubresource(texture.texture.Get(), 0, nullptr, rgba, width * 4, width * height * 4);
+}
+
 void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
     if (fb_id >= (int)mFrameBuffers.size()) {
         return;
@@ -1095,6 +1309,22 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
     if (!resource.pData) {
         mContext->Unmap(mReadbackStaging.Get(), 0);
         return;
+    }
+
+    if (fb_id == 0) { // PORT: keep the full 8-bit screen pixels too, for screenshots (as gfx_metal.cpp, BGRA)
+        gPortScreenBgra.resize((size_t)srcDesc.Width * srcDesc.Height * 4);
+        for (uint32_t y = 0; y < srcDesc.Height; y++) {
+            const uint8_t* row = (const uint8_t*)resource.pData + y * resource.RowPitch;
+            uint8_t* dst = &gPortScreenBgra[(size_t)y * srcDesc.Width * 4];
+            for (uint32_t x = 0; x < srcDesc.Width; x++) {
+                dst[x * 4 + 0] = row[x * 4 + 2];
+                dst[x * 4 + 1] = row[x * 4 + 1];
+                dst[x * 4 + 2] = row[x * 4 + 0];
+                dst[x * 4 + 3] = row[x * 4 + 3];
+            }
+        }
+        gPortScreenW = srcDesc.Width;
+        gPortScreenH = srcDesc.Height;
     }
 
     // Convert RGBA32 → RGBA16 with nearest-neighbor scaling from actual texture
@@ -1243,7 +1473,8 @@ void GfxRenderingAPIDX11::SetSrgbMode() {
     mSrgbMode = true;
 }
 
-#define RAND_NOISE "((random(float3(floor(screenSpace.xy * noise_scale), noise_frame)) + 1.0) / 2.0)"
+// random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
+#define RAND_NOISE "random(float3(floor(screenSpace.xy * noise_scale), noise_frame))"
 
 static const char* prism_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                             bool first_cycle, bool hint_single_element) {

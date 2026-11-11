@@ -1,9 +1,11 @@
+#include <unordered_set>
 #include "ship/window/Window.h"
 #ifdef ENABLE_OPENGL
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <map>
 #include <unordered_map>
@@ -19,6 +21,7 @@
 #endif
 
 #include "fast/backends/gfx_opengl.h"
+#include "fast/backends/resize_keep.h"
 #include "ship/window/gui/Gui.h"
 #include <prism/processor.h>
 #include <fstream>
@@ -107,7 +110,8 @@ void GfxRenderingAPIOGL::LoadShader(ShaderProgram* new_prg) {
     SetUniforms(new_prg);
 }
 
-#define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
+// random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
+#define RAND_NOISE "random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count)))"
 
 static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                       bool first_cycle, bool hint_single_element) {
@@ -244,6 +248,33 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
     return *inc;
 }
 
+// PORT: dual-source blending (GL 3.3 / ARB_blend_func_extended), as the Metal backend: the colour blends by a second
+// shader output's alpha while the alpha written is the N64 coverage bit. PORT_GL_NO_DUAL=1: the old blending.
+// OpenGL ES: with GL_EXT_blend_func_extended (Adreno, Mali, PowerVR have it). Without it effects that read the
+// screen back as a texture saw the wrong alpha: the Poke Ball send-out burst came out grey and blocky.
+static bool DualSource() {
+#ifdef USE_OPENGLES
+    static const bool on = [] {
+        if (getenv("PORT_GL_NO_DUAL") != nullptr) {
+            return false;
+        }
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n; i++) {
+            const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+            if (ext != nullptr && strcmp(ext, "GL_EXT_blend_func_extended") == 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return on;
+#else
+    static const bool on = getenv("PORT_GL_NO_DUAL") == nullptr;
+    return on;
+#endif
+}
+
 std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     prism::Processor processor;
     prism::ContextItems mContext = {
@@ -289,6 +320,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
         { "append_formula", (InvokeFunc)append_formula },
 #ifdef __APPLE__
+        { "dual_source", DualSource() },
         { "GLSL_VERSION", "#version 410 core" },
         { "attr", "in" },
         { "opengles", false },
@@ -296,21 +328,42 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "texture", "texture" },
         { "vOutColor", "vOutColor" },
 #elif defined(USE_OPENGLES)
-        { "GLSL_VERSION", "#version 300 es\nprecision mediump float;" },
+        { "dual_source", DualSource() },
+        { "GLSL_VERSION", DualSource() && cc_features.opt_alpha
+                              ? "#version 300 es\n#extension GL_EXT_blend_func_extended : require\nprecision mediump float;"
+                              : "#version 300 es\nprecision mediump float;" },
         { "attr", "in" },
         { "opengles", true },
         { "core_opengl", false },
         { "texture", "texture" },
         { "vOutColor", "vOutColor" },
 #else
+        { "dual_source", DualSource() },
         { "GLSL_VERSION", "#version 130" },
         { "attr", "varying" },
         { "opengles", false },
         { "core_opengl", false },
         { "texture", "texture2D" },
-        { "vOutColor", "gl_FragColor" },
+        // PORT: dual-source shaders write their own outputs (gl_FragColor cannot be combined with them)
+        { "vOutColor", DualSource() && cc_features.opt_alpha ? "vOutColor" : "gl_FragColor" },
 #endif
     };
+    // PORT: the fragment outputs, as flat flags (prism drops the rest of the shader after a nested or @elseif branch
+    // that is taken)
+    const bool dualOut = DualSource() && cc_features.opt_alpha;
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    const bool coreOrEs = true;
+#else
+    const bool coreOrEs = false;
+#endif
+#ifdef USE_OPENGLES
+    mContext["dual_out"] = false;
+    mContext["dual_out_es"] = dualOut; // (the outputs' indices as layout qualifiers: ES has no glBindFragDataLocationIndexed)
+#else
+    mContext["dual_out"] = dualOut;
+    mContext["dual_out_es"] = false;
+#endif
+    mContext["single_out"] = !dualOut && coreOrEs;
     processor.populate(mContext);
     auto init = std::make_shared<Ship::ResourceInitData>();
     init->Type = (uint32_t)Ship::ResourceType::Shader;
@@ -409,11 +462,7 @@ void GfxRenderingAPIOGL::ClearShaderCache() {
     mShaderProgramPool.clear();
 }
 
-ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
-    CCFeatures cc_features;
-    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
-    const auto fs_buf = BuildFsShader(cc_features);
-    const auto vs_buf = BuildVsShader(cc_features);
+GLuint GfxRenderingAPIOGL::CompileProgram(const std::string& vs_buf, const std::string& fs_buf, bool dualSource) {
     const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
     const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
     GLint success;
@@ -427,7 +476,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
         char error_log[1024];
         // fprintf(stderr, "Vertex shader compilation failed\n");
-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
+        glGetShaderInfoLog(vertex_shader, sizeof(error_log), &max_length, &error_log[0]);
         // fprintf(stderr, "%s\n", &error_log[0]);
         abort();
     }
@@ -441,7 +490,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
         char error_log[1024];
         fprintf(stderr, "Fragment shader compilation failed\n");
-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
+        glGetShaderInfoLog(fragment_shader, sizeof(error_log), &max_length, &error_log[0]);
         fprintf(stderr, "%s\n", &error_log[0]);
         abort();
     }
@@ -449,7 +498,84 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     GLuint shader_program = glCreateProgram();
     glAttachShader(shader_program, vertex_shader);
     glAttachShader(shader_program, fragment_shader);
+#ifndef USE_OPENGLES
+    if (dualSource) { // PORT: dual-source blending outputs (default.shader.glsl)
+        glBindFragDataLocationIndexed(shader_program, 0, 0, "vOutColor");
+        glBindFragDataLocationIndexed(shader_program, 0, 1, "vOutColor1");
+    }
+#endif
+#ifndef __EMSCRIPTEN__
+    if (mProgramBinaries) glProgramParameteri(shader_program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+#endif
     glLinkProgram(shader_program);
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+    if (!success) { // PORT: report link failures too
+        char error_log[1024];
+        GLsizei len = 0;
+        glGetProgramInfoLog(shader_program, sizeof error_log, &len, error_log);
+        fprintf(stderr, "Shader program link failed\n%.*s\nfragment shader:\n%s\n", (int)len, error_log, fs_buf.c_str());
+        abort();
+    }
+
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+    return shader_program;
+}
+
+GLuint GfxRenderingAPIOGL::LoadProgramBinary(uint64_t key) {
+#ifndef __EMSCRIPTEN__
+    if (!mProgramBinaries) return 0;
+    const auto blob = mShaderCache.Load(key);
+    if (blob.size() <= sizeof(GLenum)) return 0;
+    GLenum format;
+    memcpy(&format, blob.data(), sizeof(format));
+    GLuint program = glCreateProgram();
+    glProgramBinary(program, format, blob.data() + sizeof(format), static_cast<GLsizei>(blob.size() - sizeof(format)));
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked) return program;
+    glDeleteProgram(program);
+    // A rejected driver binary is a cache miss. Clear its GL errors before rebuilding.
+    while (glGetError() != GL_NO_ERROR) {}
+#endif
+    return 0;
+}
+
+void GfxRenderingAPIOGL::StoreProgramBinary(uint64_t key, GLuint program) {
+#ifndef __EMSCRIPTEN__
+    if (!mProgramBinaries) return;
+    GLint size = 0;
+    glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &size);
+    if (size <= 0) return;
+    std::vector<char> blob(sizeof(GLenum) + size);
+    GLenum format;
+    glGetProgramBinary(program, size, &size, &format, blob.data() + sizeof(format));
+    memcpy(blob.data(), &format, sizeof(format));
+    if (size > 0) mShaderCache.Store(key, blob.data(), sizeof(format) + size);
+#endif
+}
+
+ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    CCFeatures cc_features;
+    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+    const auto fs_buf = BuildFsShader(cc_features);
+    const auto vs_buf = BuildVsShader(cc_features);
+    if (const char* dumpDir = getenv("PORT_GL_DUMP_SHADERS")) { // debug: the generated GLSL, one file per shader
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%016llx_%016llx.glsl", dumpDir, (unsigned long long)shader_id0,
+                 (unsigned long long)shader_id1);
+        if (FILE* f = fopen(path, "w")) {
+            fprintf(f, "// vertex\n%s\n// fragment\n%s\n", vs_buf.c_str(), fs_buf.c_str());
+            fclose(f);
+        }
+    }
+    const bool dualSource = DualSource() && cc_features.opt_alpha;
+    const uint64_t key = ShaderDiskCache::Hash({mDriverIdentity, vs_buf, fs_buf, dualSource ? "dual" : "single"});
+    GLuint shader_program = LoadProgramBinary(key);
+    if (shader_program == 0) {
+        shader_program = CompileProgram(vs_buf, fs_buf, dualSource);
+        StoreProgramBinary(key, shader_program);
+    }
 
     size_t cnt = 0;
 
@@ -560,6 +686,7 @@ GLuint GfxRenderingAPIOGL::NewTexture() {
     GLuint ret;
     glGenTextures(1, &ret);
     textures.resize(std::max(textures.size(), (size_t)ret + 1));
+    textures[ret] = {}; // no storage yet (the name may be one deleted before)
     return ret;
 }
 
@@ -584,9 +711,17 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
     if (width == 0 || height == 0) {
         return;
     }
+    TextureInfo& info = textures[mCurrentTextureIds[mCurrentTile]];
+    // PORT: a texture id recycled by the texture cache keeps its storage when the size is the same; specifying it
+    // again made the driver free and allocate the storage (ioctl_kgsl_sharedmem_munmap inside glTexImage2D on the
+    // AYN Thor's Adreno 740)
+    if (info.width == width && info.height == height) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
+        return;
+    }
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
-    textures[mCurrentTextureIds[mCurrentTile]].width = width;
-    textures[mCurrentTextureIds[mCurrentTile]].height = height;
+    info.width = width;
+    info.height = height;
 }
 
 #ifdef USE_OPENGLES
@@ -730,7 +865,17 @@ void GfxRenderingAPIOGL::Init() {
     glEnable(GL_DEPTH_CLAMP);
 #endif
     glDepthFunc(GL_LEQUAL);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+#ifndef GL_SRC1_ALPHA
+#define GL_SRC1_ALPHA 0x8589           // GL_SRC1_ALPHA_EXT
+#define GL_ONE_MINUS_SRC1_ALPHA 0x88FB // GL_ONE_MINUS_SRC1_ALPHA_EXT
+#endif
+    // PORT: dual-source, as gfx_metal.cpp: RGB = src * a + dst * (1 - a) with a = the shader's second output's alpha;
+    // alpha = coverage (the first output's alpha: 1, or 0 for o_invisible draws, which keep the old alpha)
+    if (DualSource()) {
+        glBlendFuncSeparate(GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
 
     mFrameBuffers.resize(1); // for the default screen buffer
 
@@ -748,6 +893,33 @@ void GfxRenderingAPIOGL::Init() {
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
 
+#ifndef __EMSCRIPTEN__
+#ifdef FAST_GFX_OPENGL_USE_GLEW
+    mProgramBinaries = (GLEW_VERSION_4_1 || GLEW_ARB_get_program_binary) &&
+                      glProgramBinary && glGetProgramBinary && glProgramParameteri;
+#elif defined(USE_OPENGLES)
+    mProgramBinaries = true;
+#else
+    mProgramBinaries = SDL_GL_ExtensionSupported("GL_ARB_get_program_binary");
+#endif
+    if (mProgramBinaries) {
+        GLint formats = 0;
+        glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
+        mProgramBinaries = formats > 0;
+    }
+    if (mProgramBinaries) {
+        mShaderCache.Open("opengl");
+        for (GLenum name : {GL_VENDOR, GL_RENDERER, GL_VERSION}) {
+            const auto value = glGetString(name);
+            mDriverIdentity += value ? reinterpret_cast<const char*>(value) : "";
+            mDriverIdentity += '\n';
+        }
+    }
+    if (getenv("PORT_TRACE_SHADER_CACHE")) {
+        fprintf(stderr, "[shader-cache] OpenGL program binaries %s\n", mProgramBinaries ? "supported" : "unavailable");
+    }
+#endif
+
     sOGLResourceManager = mResourceManager;
 }
 
@@ -759,6 +931,15 @@ void GfxRenderingAPIOGL::StartFrame() {
 }
 
 void GfxRenderingAPIOGL::EndFrame() {
+    static const bool sGlCheck = getenv("PORT_GL_CHECK") != nullptr; // debug: report GL errors once per frame
+    if (sGlCheck) {
+        for (GLenum err; (err = glGetError()) != GL_NO_ERROR;) {
+            static int reported = 0;
+            if (reported++ < 20) {
+                fprintf(stderr, "[gl] error 0x%04x\n", err);
+            }
+        }
+    }
     glFlush();
 }
 
@@ -797,10 +978,19 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     return i;
 }
 
+// PORT: framebuffers whose colour texture was just (re)created have undefined contents; the first pass into one clears
+// it to black, as an untouched N64 frame buffer would read (see gfx_metal.cpp)
+static std::unordered_set<int> sFreshColorFbs;
+
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                      bool can_extract_depth) {
     FramebufferOGL& fb = mFrameBuffers[fb_id];
+    static const bool sFbLog = getenv("PORT_GL_FBLOG") != nullptr; // debug
+    if (sFbLog && (fb.width != std::max(width, 1U) || fb.height != std::max(height, 1U) || fb.invertY != opengl_invertY)) {
+        fprintf(stderr, "[glfb] %d %ux%u msaa %u invertY %d target %d\n", fb_id, width, height, msaa_level,
+                (int)opengl_invertY, (int)render_target);
+    }
 
     width = std::max(width, 1U);
     height = std::max(height, 1U);
@@ -808,16 +998,45 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
+    // PORT: the old picture survives the resize (fast/backends/resize_keep.h): copied aside at its size, then blitted
+    // back scaled once every attachment has its new size (a framebuffer draws only where all its attachments reach).
+    // MSAA renderbuffers cannot be scaled by a blit: they still start cleared.
+    GLuint keepTex = 0, keepFbo = 0;
+    const int ow = (int)fb.width, oh = (int)fb.height;
+    GLboolean scissorWasEnabled = GL_FALSE;
+
     if (fb_id != 0) {
         if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
             if (msaa_level <= 1) {
+                if (render_target && PortResizeKeepEnabled() && fb.msaa_level <= 1 && ow > 1 && oh > 1 &&
+                    (fb.width != width || fb.height != height)) {
+                    // blits and clears obey the scissor test (the game's last scissor): off meanwhile, then as it was
+                    scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
+                    glDisable(GL_SCISSOR_TEST);
+                    glGenTextures(1, &keepTex);
+                    glBindTexture(GL_TEXTURE_2D, keepTex);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ow, oh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glGenFramebuffers(1, &keepFbo);
+                    glBindFramebuffer(GL_FRAMEBUFFER, keepFbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, keepTex, 0);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, keepFbo);
+                    glBlitFramebuffer(0, 0, ow, oh, 0, 0, ow, oh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+                }
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                // PORT: RGBA (was RGB8): the alpha channel holds the N64 colour image's coverage bit
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+                if (render_target && keepFbo == 0) {
+                    sFreshColorFbs.insert(fb_id);
+                }
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGBA8, width, height);
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
             }
@@ -841,6 +1060,35 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
         }
     }
 
+    bool kept = false;
+    if (keepFbo != 0) {
+        int src[4], dst[4];
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (PortResizeKeepClipped(ow, oh, (int)width, (int)height, src, dst)) {
+            // GL rows run up: the rectangles from the top-left corner are mirrored vertically (the
+            // texture's own orientation is the same before and after)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, keepFbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb.fbo);
+            glBlitFramebuffer(src[0], oh - src[3], src[2], oh - src[1], dst[0], (int)height - dst[3],
+                              dst[2], (int)height - dst[1], GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+        }
+        if (sFbLog) {
+            fprintf(stderr, "[glfb] %d kept %dx%d -> %ux%u src %d,%d,%d,%d dst %d,%d,%d,%d\n", fb_id, ow, oh, width,
+                    height, src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3]);
+        }
+        glDeleteFramebuffers(1, &keepFbo);
+        glDeleteTextures(1, &keepTex);
+        if (scissorWasEnabled) {
+            glEnable(GL_SCISSOR_TEST);
+        }
+        kept = true;
+    }
+    if (kept) {
+        sFreshColorFbs.erase(fb_id);
+    }
+
     fb.width = width;
     fb.height = height;
     fb.has_depth_buffer = has_depth_buffer;
@@ -856,6 +1104,27 @@ void GfxRenderingAPIOGL::StartDrawToFramebuffer(int fb_id, float noise_scale) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
     mCurrentFrameBuffer = fb_id;
+    static const bool sNoFreshClear = getenv("PORT_NO_FRESH_CLEAR") != nullptr; // debug: old behaviour
+    if (sFreshColorFbs.erase(fb_id) != 0 && !sNoFreshClear) {
+        ClearFramebuffer(true, false);
+    }
+}
+
+bool GfxRenderingAPIOGL::ClearFramebufferColor(float r, float g, float b, float a) {
+    if (mCurrentFrameBuffer == 0) {
+        return false;
+    }
+    if (mLastScissorEnabled != 0) {
+        mLastScissorEnabled = 0;
+        glDisable(GL_SCISSOR_TEST);
+    }
+    glClearColor(r, g, b, a);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+    return true;
 }
 
 void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
@@ -928,6 +1197,10 @@ void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     if (texId >= textures.size()) {
         textures.resize((size_t)texId + 1);
     }
+    // PORT: the shader's filtering divides by the texture size: with the empty entry (0x0) render-to-texture images
+    // sampled as nothing (Game Pak Check panels, menu buttons)
+    textures[texId].width = (uint16_t)mFrameBuffers[fb_id].width;
+    textures[texId].height = (uint16_t)mFrameBuffers[fb_id].height;
     SelectTexture(tile, texId);
 }
 
@@ -1003,6 +1276,26 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
     }
 }
 
+extern std::vector<uint8_t> gPortScreenBgra; // interpreter.cpp
+extern uint32_t gPortScreenW, gPortScreenH;
+
+void GfxRenderingAPIOGL::InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) {
+    const auto& fb = mFrameBuffers.at(fbId);
+    GLint binding;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &binding);
+    glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
+    if (fb.invertY) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    } else {
+        std::vector<uint8_t> flipped((size_t)width * height * 4);
+        for (uint32_t y = 0; y < height; ++y)
+            memcpy(flipped.data() + (size_t)y * width * 4, rgba + (size_t)(height - 1 - y) * width * 4, width * 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+    }
+    glBindTexture(GL_TEXTURE_2D, binding);
+    sFreshColorFbs.erase(fbId);
+}
+
 void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
     if (fb_id >= (int)mFrameBuffers.size()) {
         return;
@@ -1016,7 +1309,30 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
 
     std::vector<uint8_t> rgba8(width * height * 4);
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
+    if (!mFrameBuffers[fb_id].invertY) {
+        // PORT: glReadPixels returns the bottom row first; a buffer drawn without Y inversion (the window) holds the
+        // picture the right way up, so its rows are reversed to give the top row first (as the other backends)
+        std::vector<uint8_t> row(width * 4);
+        for (uint32_t y = 0; y < height / 2; y++) {
+            uint8_t* a = &rgba8[(size_t)y * width * 4];
+            uint8_t* b = &rgba8[(size_t)(height - 1 - y) * width * 4];
+            memcpy(row.data(), a, width * 4);
+            memcpy(a, b, width * 4);
+            memcpy(b, row.data(), width * 4);
+        }
+    }
 
+    if (fb_id == 0) { // PORT: keep the full 8-bit screen pixels too, for screenshots (as gfx_metal.cpp, BGRA)
+        gPortScreenBgra.resize(rgba8.size());
+        for (size_t i = 0; i < rgba8.size(); i += 4) {
+            gPortScreenBgra[i + 0] = rgba8[i + 2];
+            gPortScreenBgra[i + 1] = rgba8[i + 1];
+            gPortScreenBgra[i + 2] = rgba8[i + 0];
+            gPortScreenBgra[i + 3] = rgba8[i + 3];
+        }
+        gPortScreenW = width;
+        gPortScreenH = height;
+    }
     for (uint32_t i = 0; i < width * height; i++) {
         uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
         uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;

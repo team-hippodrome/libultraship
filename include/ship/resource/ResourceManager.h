@@ -69,6 +69,11 @@ class ResourceManager : public Component {
 
     /** @brief Returns the ArchiveManager that manages the mounted archives. */
     std::shared_ptr<ArchiveManager> GetArchiveManager();
+    /**
+     * @brief PORT: an archive (a ZIP image) built into the executable, mounted by Init before the archives found on
+     * disk. Call before Init; the memory must outlive the ResourceManager.
+     */
+    void SetBuiltInArchive(const std::string& name, const void* data, size_t size);
     /** @brief Returns the ResourceLoader responsible for deserializing file data. */
     std::shared_ptr<ResourceLoader> GetResourceLoader();
 
@@ -449,6 +454,9 @@ class ResourceManager : public Component {
     std::shared_ptr<Archive> mDefaultCacheArchive = nullptr;
     std::shared_ptr<ThreadPool> mThreadPool;
     std::shared_ptr<Keystore> mKeystore;
+    std::string mBuiltInArchiveName; // PORT: SetBuiltInArchive
+    const void* mBuiltInArchiveData = nullptr;
+    size_t mBuiltInArchiveSize = 0;
 
     std::shared_ptr<ThreadPool> GetThreadPool();
 };

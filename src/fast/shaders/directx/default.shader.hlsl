@@ -189,6 +189,10 @@ PSInput VSMain(
 
 struct PSOutput {
     float4 color : SV_TARGET;
+    @if(o_alpha)
+    // PORT: dual-source blending (gfx_direct3d11.cpp): colour blends by color1.a; the alpha written is color.a
+    float4 color1 : SV_TARGET1;
+    @end
     @if(o_prim_depth)
     float depth : SV_Depth;
     @end
@@ -335,6 +339,14 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
 
     PSOutput output;
     @if(o_alpha)
+        // PORT: the alpha written is the N64 coverage bit: 1 for every drawn pixel, kept (0) for o_invisible draws
+        // (as default.shader.metal); the blend alpha goes to the second output
+        output.color1 = float4(0.0, 0.0, 0.0, texel.a);
+        @if(o_invisible)
+            texel.a = 0.0;
+        @else
+            texel.a = 1.0;
+        @end
         @if(srgb_mode)
             output.color = fromLinear(texel);
         @else

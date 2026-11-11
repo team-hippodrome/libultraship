@@ -84,7 +84,8 @@ endif()
 
 include(cmake/dependencies/common.cmake)
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+	# Emscripten (the web build): the same libraries as Android, fetched and built from source
 	include(cmake/dependencies/android.cmake)
 endif()
 

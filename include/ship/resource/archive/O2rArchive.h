@@ -35,6 +35,12 @@ class O2rArchive final : virtual public Archive {
      */
     O2rArchive(const std::string& archivePath, std::shared_ptr<ResourceManager> resourceManager = nullptr,
                std::shared_ptr<Keystore> keystore = nullptr);
+    /**
+     * @brief PORT: constructs a read-only O2rArchive over a ZIP image in memory (an archive built into the
+     * executable). The memory must stay valid for the archive's lifetime; @p name only labels it.
+     */
+    O2rArchive(const std::string& name, const void* data, size_t size,
+               std::shared_ptr<ResourceManager> resourceManager = nullptr, std::shared_ptr<Keystore> keystore = nullptr);
     ~O2rArchive();
 
     /**
@@ -76,6 +82,10 @@ class O2rArchive final : virtual public Archive {
     zip_t* GetZipHandle();
     /** @brief Returns a zip_t* handle back to the pool for reuse. */
     void ReleaseZipHandle(zip_t* handle);
+    /** @brief PORT: opens the file, or the image in memory (read-only). */
+    zip_t* OpenZip(int flags);
+    const void* mMemoryData = nullptr;
+    size_t mMemorySize = 0;
     zip_t* mZipArchive;
     std::mutex mPoolMutex;
     std::vector<zip_t*> mZipArchivePool;

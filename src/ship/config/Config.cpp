@@ -200,12 +200,12 @@ void Config::Copy(const std::string& fromKey, const std::string& toKey) {
 }
 
 void Config::Reload() {
-    if (mPath == "None" || !fs::exists(mPath) || !fs::is_regular_file(mPath)) {
+    if (mPath == "None" || !fs::exists(fs::u8path(mPath)) || !fs::is_regular_file(fs::u8path(mPath))) {
         mIsNewInstance = true;
         mFlattenedJson = nlohmann::json::object();
         return;
     }
-    std::ifstream ifs(mPath);
+    std::ifstream ifs(fs::u8path(mPath));
 
     mNestedJson = nlohmann::json::object();
     mFlattenedJson = nlohmann::json::object();
@@ -218,7 +218,7 @@ void Config::Reload() {
 }
 
 void Config::Save() {
-    std::ofstream file(mPath);
+    std::ofstream file(fs::u8path(mPath));
     mNestedJson = mFlattenedJson.unflatten();
     file << mNestedJson.dump(4);
 }

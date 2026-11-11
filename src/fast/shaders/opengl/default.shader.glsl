@@ -79,7 +79,17 @@
         @end
     }
 @else
-    @if(core_opengl || opengles)
+    @if(dual_out)
+    // PORT: dual-source blending (gfx_opengl.cpp binds them to colour 0, index 0 and 1): colour blends by
+    // vOutColor1.a; the alpha written is vOutColor.a
+    out vec4 vOutColor;
+    out vec4 vOutColor1;
+    @end
+    @if(dual_out_es)
+    layout(location = 0, index = 0) out vec4 vOutColor;
+    layout(location = 0, index = 1) out vec4 vOutColor1;
+    @end
+    @if(single_out)
     out vec4 vOutColor;
     @end
 
@@ -278,10 +288,22 @@
             @if(o_alpha_threshold)
                 if (texel.a < 8.0 / 256.0) discard;
             @end
+            // Depth-only masks preserve colour and coverage. The second output's alpha drives RGB blending.
             @if(o_invisible)
                 texel.a = 0.0;
             @end
-            @{vOutColor} = texel;
+            @if(dual_source)
+                // PORT: the alpha written is the N64 coverage bit: 1 for every drawn pixel, kept (0) for o_invisible
+                // draws; the blend alpha goes to the second output (as default.shader.metal)
+                @if(o_invisible)
+                    @{vOutColor} = vec4(texel.rgb, 0.0);
+                @else
+                    @{vOutColor} = vec4(texel.rgb, 1.0);
+                @end
+                vOutColor1 = vec4(0.0, 0.0, 0.0, texel.a);
+            @else
+                @{vOutColor} = texel;
+            @end
         @else
             @{vOutColor} = vec4(texel, 1.0);
         @end

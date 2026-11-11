@@ -88,19 +88,19 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     void UpdateMousePrevPos();
     void ApplyMouseCaptureClip();
 
-    std::tuple<HMONITOR, RECT, BOOL> mMonitor; // 0: Handle, 1: Display Monitor Rect, 2: Is_Primary
-    uint32_t current_width, current_height;    // Width and height of client areas
+    std::tuple<HMONITOR, RECT, BOOL> mMonitor;      // 0: Handle, 1: Display Monitor Rect, 2: Is_Primary
+    uint32_t current_width = 0, current_height = 0; // Width and height of client areas
     std::vector<std::tuple<HMONITOR, RECT, BOOL>> monitor_list;
-    int32_t mPosX, mPosY; // Screen coordinates
-    double mDetectedHz;
-    double mDisplayPeriod; // (1000 / dxgi.mDetectedHz) in ms
-    void (*mOnAllKeysUp)(void);
-    POINT mRawMouseDeltaBuf;
-    float mMouseWheel[2];
-    bool mIsMouseCaptured;
-    bool mIsMouseHovered;
-    bool mInFocus;
-    bool mHasMousePosition;
+    int32_t mPosX = 0, mPosY = 0; // Screen coordinates
+    double mDetectedHz = 0;
+    double mDisplayPeriod = 0; // (1000 / dxgi.mDetectedHz) in ms
+    void (*mOnAllKeysUp)(void) = nullptr;
+    POINT mRawMouseDeltaBuf = {};
+    float mMouseWheel[2] = {};
+    bool mIsMouseCaptured = false;
+    bool mIsMouseHovered = false;
+    bool mInFocus = false;
+    bool mHasMousePosition = false;
 
     // These need to be public to be accessible in the window callback
     std::shared_ptr<Ship::FileDrop> mFileDrop;
@@ -112,35 +112,35 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     void ApplyMaxFrameLatency(bool first);
     void ToggleBorderlessWindowFullScreen(bool enable, bool callCallback);
 
-    HWND h_wnd;
+    HWND h_wnd = nullptr;
     // These four only apply in windowed mode.
 
-    HMODULE dxgi_module;
-    HRESULT(__stdcall* CreateDXGIFactory1)(REFIID riid, void** factory);
-    HRESULT(__stdcall* CreateDXGIFactory2)(UINT flags, REFIID iid, void** factory);
+    HMODULE dxgi_module = nullptr;
+    HRESULT(__stdcall* CreateDXGIFactory1)(REFIID riid, void** factory) = nullptr;
+    HRESULT(__stdcall* CreateDXGIFactory2)(UINT flags, REFIID iid, void** factory) = nullptr;
 
-    bool mLastMaximizedState;
+    bool mLastMaximizedState = false;
 
-    bool mDXGI11_4;
+    bool mDXGI11_4 = false;
     Microsoft::WRL::ComPtr<IDXGIFactory2> mFactory;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain;
-    HANDLE mWaitableObject;
+    HANDLE mWaitableObject = nullptr;
     Microsoft::WRL::ComPtr<IUnknown> mSwapChainDevice; // D3D11 Device or D3D12 Command Queue
     std::function<void()> mBeforeDestroySwapChainFn;
-    uint64_t mFrameTimeStamp; // in units of 1/FRAME_INTERVAL_NS_DENOMINATOR nanoseconds
+    uint64_t mFrameTimeStamp = 0; // in units of 1/FRAME_INTERVAL_NS_DENOMINATOR nanoseconds
     std::map<UINT, DXGI_FRAME_STATISTICS> mFrameStats;
     std::set<std::pair<UINT, UINT>> mPendingFrameStats;
-    bool mDroppedFrame;
-    bool mZeroLatency;
-    uint32_t mMaxFrameLatency;
-    uint32_t mAppliedMaxFrameLatency;
-    HANDLE mTimer;
-    bool mTearingSupport;
-    bool mMousePressed[5];
-    LARGE_INTEGER mPreviousPresentTime;
+    bool mDroppedFrame = false;
+    bool mZeroLatency = false;
+    uint32_t mMaxFrameLatency = 0;
+    uint32_t mAppliedMaxFrameLatency = 0;
+    HANDLE mTimer = nullptr;
+    bool mTearingSupport = false;
+    bool mMousePressed[5] = {};
+    LARGE_INTEGER mPreviousPresentTime = {};
 
-    RAWINPUTDEVICE mRawInputDevice[1];
-    POINT mPrevMouseCursorPos;
+    RAWINPUTDEVICE mRawInputDevice[1] = {};
+    POINT mPrevMouseCursorPos = {};
 
     std::shared_ptr<Ship::Config> mConfig;
 };

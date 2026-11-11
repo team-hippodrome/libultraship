@@ -18,6 +18,10 @@ struct DrawUniforms {
 
 struct FragOut {
     float4 color [[color(0)]];
+    @if(o_alpha)
+    // PORT: dual-source blending: colour blends by color1.a; the alpha written is color.a, the N64's coverage bit
+    float4 color1 [[color(0), index(1)]];
+    @end
     @if(o_prim_depth)
     float depth [[depth(any)]];
     @end
@@ -294,7 +298,16 @@ fragment FragOut fragmentShader(
         @if(o_invisible)
             texel.w = 0.0;
         @end
-        out.color = texel;
+        // PORT: an N64 colour image's alpha bit is pixel coverage: every pixel a primitive draws (not discarded by
+        // the alpha compare) reads as present afterwards, whatever its blend alpha (striped signs with transparent
+        // texels, translucent flames drawn into render-to-texture images). Draws that only keep the memory colour
+        // (o_invisible) leave it as it was.
+        @if(o_invisible)
+            out.color = float4(texel.xyz, 0.0);
+        @else
+            out.color = float4(texel.xyz, 1.0);
+        @end
+        out.color1 = float4(0.0, 0.0, 0.0, texel.w);
     @else
         out.color = float4(texel, 1.0);
     @end

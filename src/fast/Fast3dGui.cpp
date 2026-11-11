@@ -1,5 +1,7 @@
 #include "fast/Fast3dGui.h"
 
+#include <algorithm>
+
 #include "fast/Fast3dWindow.h"
 #include "ship/core/Context.h"
 #include "ship/config/ConsoleVariable.h"
@@ -7,6 +9,7 @@
 #include "ship/config/Config.h"
 #include "ship/resource/ResourceManager.h"
 #include "fast/backends/gfx_metal.h"
+#include "fast/backends/gfx_vulkan.h"
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/resource/type/Texture.h"
@@ -32,7 +35,12 @@
 #include <imgui_impl_sdl3.h>
 #endif
 
+#ifdef ENABLE_VULKAN
+#include <imgui_impl_sdl3.h>
+#endif
+
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+#include <d3d11.h> // PORT: the nearest sampler (UseNearestSamplingForImGui)
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 
@@ -93,7 +101,8 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
 
     switch (window->GetWindowBackend()) {
         case WindowBackend::FAST3D_SDL_OPENGL:
-        case WindowBackend::FAST3D_SDL_METAL: {
+        case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::FAST3D_SDL_VULKAN: {
             ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
 #if defined(__ANDROID__) || defined(__IOS__)
             SDL_Window* sdlWindow = window->GetWindowBackend() == WindowBackend::FAST3D_SDL_OPENGL
@@ -135,6 +144,15 @@ void Fast3dGui::ImGuiWMInit() {
             ImGui_ImplSDL3_InitForMetal(static_cast<SDL_Window*>(mImpl.Metal.Window));
             break;
 #endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+            if (mConsoleVariables->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
+                SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+            }
+            ImGui_ImplSDL3_InitForVulkan(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+            break;
+#endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplWin32_Init(mImpl.Dx11.Window);
@@ -158,6 +176,11 @@ void Fast3dGui::ImGuiWMShutdown() {
 #endif
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
+            ImGui_ImplSDL3_Shutdown();
+            break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN:
             ImGui_ImplSDL3_Shutdown();
             break;
 #endif
@@ -194,6 +217,14 @@ void Fast3dGui::ImGuiBackendInit() {
         }
 #endif
 
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN: {
+            GfxRenderingAPIVK* api = (GfxRenderingAPIVK*)mInterpreter.lock()->GetCurrentRenderingAPI();
+            api->VulkanInit(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+            break;
+        }
+#endif
+
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
             ImGui_ImplDX11_Init(static_cast<ID3D11Device*>(mImpl.Dx11.Device),
@@ -217,6 +248,13 @@ void Fast3dGui::ImGuiBackendShutdown() {
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplMetal_Shutdown();
             break;
+#endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN: {
+            GfxRenderingAPIVK* api = (GfxRenderingAPIVK*)mInterpreter.lock()->GetCurrentRenderingAPI();
+            api->ShutdownImGui();
+            break;
+        }
 #endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
         case WindowBackend::FAST3D_DXGI_DX11:
@@ -250,6 +288,13 @@ void Fast3dGui::ImGuiBackendNewFrame() {
             break;
         }
 #endif
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN: {
+            GfxRenderingAPIVK* api = (GfxRenderingAPIVK*)mInterpreter.lock()->GetCurrentRenderingAPI();
+            api->NewFrame();
+            break;
+        }
+#endif
         default:
             break;
     }
@@ -260,6 +305,7 @@ void Fast3dGui::ImGuiWMNewFrame() {
     switch (window->GetWindowBackend()) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
+        case WindowBackend::FAST3D_SDL_VULKAN:
             ImGui_ImplSDL3_NewFrame();
             break;
 #ifdef ENABLE_DX11
@@ -277,7 +323,8 @@ void Fast3dGui::ImGuiWMNewFrame() {
 void Fast3dGui::RefreshImGuiGamepads() {
     auto window = mWindow;
     auto backend = window->GetWindowBackend();
-    if (backend != WindowBackend::FAST3D_SDL_OPENGL && backend != WindowBackend::FAST3D_SDL_METAL) {
+    if (backend != WindowBackend::FAST3D_SDL_OPENGL && backend != WindowBackend::FAST3D_SDL_METAL &&
+        backend != WindowBackend::FAST3D_SDL_VULKAN) {
         return;
     }
 
@@ -296,6 +343,14 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL: {
             GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
+            api->RenderDrawData(data);
+            break;
+        }
+#endif
+
+#ifdef ENABLE_VULKAN
+        case WindowBackend::FAST3D_SDL_VULKAN: {
+            GfxRenderingAPIVK* api = (GfxRenderingAPIVK*)mInterpreter.lock()->GetCurrentRenderingAPI();
             api->RenderDrawData(data);
             break;
         }
@@ -358,8 +413,15 @@ void Fast3dGui::CalculateGameViewport() {
     mainPos.x -= mTemporaryWindowPos.x;
     mainPos.y -= mTemporaryWindowPos.y;
     ImVec2 size = ImGui::GetContentRegionAvail();
-    mInterpreter.lock()->mCurDimensions.width = (uint32_t)(size.x * mInterpreter.lock()->mCurDimensions.internal_mul);
-    mInterpreter.lock()->mCurDimensions.height = (uint32_t)(size.y * mInterpreter.lock()->mCurDimensions.internal_mul);
+    // PORT: gAdvancedResolution.MatchPixels: the window's size in pixels, not ImGui's points (a HiDPI display has
+    // several pixels per point; "Match window" draws every one of them)
+    float mul = mInterpreter.lock()->mCurDimensions.internal_mul;
+    if (mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".MatchPixels", 0) &&
+        ImGui::GetIO().DisplayFramebufferScale.x > 0.0f) {
+        mul *= ImGui::GetIO().DisplayFramebufferScale.x;
+    }
+    mInterpreter.lock()->mCurDimensions.width = (uint32_t)lroundf(size.x * mul);
+    mInterpreter.lock()->mCurDimensions.height = (uint32_t)lroundf(size.y * mul);
     mInterpreter.lock()->mGameWindowViewport.x = (int16_t)mainPos.x;
     mInterpreter.lock()->mGameWindowViewport.y = (int16_t)mainPos.y;
     mInterpreter.lock()->mGameWindowViewport.width = (int16_t)size.x;
@@ -413,12 +475,31 @@ void Fast3dGui::DrawGame() {
     ImVec2 mainPos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetContentRegionAvail();
     ImVec2 pos = ImVec2(0, 0);
-    if (mConsoleVariables->GetInteger(CVAR_LOW_RES_MODE, 0) == 1) { // N64 Mode takes priority
+    // PORT: pixel-exact mode measures in pixels, not ImGui's points (a HiDPI display has several pixels per point:
+    // the largest whole multiple of the picture that fits the window's pixels), and a picture larger than the window
+    // (a fixed height above the window's) is fitted, scaled down, instead of being drawn at factor 1 and cut off
+    bool pixelExact = false;
+    if (mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0) &&
+        mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0) &&
+        mConsoleVariables->GetInteger(CVAR_LOW_RES_MODE, 0) != 1) {
+        const float ps = ImGui::GetIO().DisplayFramebufferScale.x > 0.0f ? ImGui::GetIO().DisplayFramebufferScale.x : 1.0f;
+        const float cw = (float)mInterpreter.lock()->mCurDimensions.width;
+        const float ch = (float)mInterpreter.lock()->mCurDimensions.height;
+        const float vw = floorf(size.x * ps + 0.5f), vh = floorf(size.y * ps + 0.5f);
+        const int factor = cw > 0 && ch > 0 ? (int)std::min(floorf(vw / cw), floorf(vh / ch)) : 0;
+        if (factor >= 1) {
+            pos = ImVec2(floorf((vw - cw * factor) / 2.0f) / ps, floorf((vh - ch * factor) / 2.0f) / ps);
+            size = ImVec2(cw * factor / ps, ch * factor / ps);
+            pixelExact = true;
+        }
+    }
+    if (pixelExact) {
+    } else if (mConsoleVariables->GetInteger(CVAR_LOW_RES_MODE, 0) == 1) { // N64 Mode takes priority
         const float sw = size.y * 320.0f / 240.0f;
         pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
         size = ImVec2(sw, size.y);
     } else if (mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0)) {
-        if (!mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0)) {
+        if (true) { // PORT: pixel-exact handled above; a picture that does not fit is fitted as in the other modes
             if (!mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".IgnoreAspectCorrection", 0)) {
                 float sWdth =
                     size.y * mInterpreter.lock()->mCurDimensions.width / mInterpreter.lock()->mCurDimensions.height;
@@ -448,11 +529,106 @@ void Fast3dGui::DrawGame() {
     }
     uintptr_t fb = mWindow->GetGfxFrameBuffer();
     if (fb) {
+        // PORT: gAdvancedResolution.NearestUpscale: a picture drawn larger than it was rendered keeps sharp pixels
+        // (nearest magnification; making it smaller stays linear)
+        auto interp = mInterpreter.lock();
+        const bool nearest = mConsoleVariables->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".NearestUpscale", 0) != 0 &&
+                             interp != nullptr && interp->mGfxFrameBufferFb >= 0;
+        const bool vulkan = mWindow->GetWindowBackend() == WindowBackend::FAST3D_SDL_VULKAN;
+        if (nearest && vulkan) {
+            if (void* id = interp->GetCurrentRenderingAPI()->GetFramebufferTextureIdNearest(interp->mGfxFrameBufferFb)) {
+                fb = (uintptr_t)id;
+            }
+        }
         ImGui::SetCursorPos(pos);
+        if (nearest && !vulkan) {
+            ImGui::GetWindowDrawList()->AddCallback(
+                [](const ImDrawList*, const ImDrawCmd* cmd) {
+                    static_cast<Fast3dGui*>(cmd->UserCallbackData)->UseNearestSamplingForImGui();
+                },
+                this);
+        }
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+        if (nearest && !vulkan) {
+            ImGui::GetWindowDrawList()->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+        }
     }
 
     ImGui::End();
+}
+
+// PORT: see DrawGame. OpenGL and DirectX 11: a sampler object for texture unit 0 (ImGui's renderers bind none of
+// their own, or only in their setup, which ImDrawCallback_ResetRenderState runs again); Metal: Metal's own pipeline copy.
+void Fast3dGui::UseNearestSamplingForImGui() {
+    switch (mWindow->GetWindowBackend()) {
+#ifdef ENABLE_OPENGL
+        case WindowBackend::FAST3D_SDL_OPENGL: {
+#ifdef _WIN32
+#define PORT_GLAPI __stdcall
+#else
+#define PORT_GLAPI
+#endif
+            // looked up at run time: glBindSampler needs OpenGL 3.3 (or ES 3); without it the picture stays linear
+            typedef void(PORT_GLAPI * GenSamplers)(int, unsigned int*);
+            typedef void(PORT_GLAPI * SamplerParameteri)(unsigned int, unsigned int, int);
+            typedef void(PORT_GLAPI * BindSampler)(unsigned int, unsigned int);
+            static BindSampler sBind = nullptr;
+            static unsigned int sSampler = 0;
+            static bool sTried = false;
+            if (!sTried) {
+                sTried = true;
+                auto gen = (GenSamplers)SDL_GL_GetProcAddress("glGenSamplers");
+                auto param = (SamplerParameteri)SDL_GL_GetProcAddress("glSamplerParameteri");
+                sBind = (BindSampler)SDL_GL_GetProcAddress("glBindSampler");
+                if (gen != nullptr && param != nullptr && sBind != nullptr) {
+                    gen(1, &sSampler);
+                    param(sSampler, 0x2801 /* GL_TEXTURE_MIN_FILTER */, 0x2601 /* GL_LINEAR */);
+                    param(sSampler, 0x2800 /* GL_TEXTURE_MAG_FILTER */, 0x2600 /* GL_NEAREST */);
+                    param(sSampler, 0x2802 /* GL_TEXTURE_WRAP_S */, 0x812F /* GL_CLAMP_TO_EDGE */);
+                    param(sSampler, 0x2803 /* GL_TEXTURE_WRAP_T */, 0x812F);
+                }
+                if (sSampler == 0) {
+                    sBind = nullptr;
+                }
+            }
+            if (sBind != nullptr) {
+                sBind(0, sSampler);
+            }
+#undef PORT_GLAPI
+            break;
+        }
+#endif
+#ifdef __APPLE__
+        case WindowBackend::FAST3D_SDL_METAL:
+            mInterpreter.lock()->GetCurrentRenderingAPI()->UseNearestSamplingForImGui();
+            break;
+#endif
+#ifdef ENABLE_DX11
+        case WindowBackend::FAST3D_DXGI_DX11: {
+            static ID3D11SamplerState* sSampler = nullptr;
+            static bool sTried = false;
+            auto* device = static_cast<ID3D11Device*>(mImpl.Dx11.Device);
+            auto* context = static_cast<ID3D11DeviceContext*>(mImpl.Dx11.DeviceContext);
+            if (!sTried && device != nullptr) {
+                sTried = true;
+                D3D11_SAMPLER_DESC sd = {};
+                sd.Filter = D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT;
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+                sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+                sd.MaxLOD = D3D11_FLOAT32_MAX;
+                if (FAILED(device->CreateSamplerState(&sd, &sSampler))) {
+                    sSampler = nullptr;
+                }
+            }
+            if (sSampler != nullptr && context != nullptr) {
+                context->PSSetSamplers(0, 1, &sSampler);
+            }
+            break;
+        }
+#endif
+        default:
+            break;
+    }
 }
 
 void Fast3dGui::ApplyResolutionChanges() {

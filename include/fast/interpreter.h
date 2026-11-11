@@ -190,13 +190,25 @@ struct TextureCacheKey {
     uint8_t fmt, siz;
     uint8_t palette_index;
     uint32_t size_bytes;
+    // PORT: hash of the texel (and palette) bytes. The game builds and rewrites textures in RAM (font files reloaded
+    // into the same buffer, icons, render targets); the N64 has no texture cache, so a cached entry is only valid
+    // while the bytes are the same.
+    uint64_t content_hash = 0;
+    // PORT: hash of the tile and load state the decoders read (sizes, line sizes, tile bounds, clamp, mask). A RAM
+    // texture's address is that of its TMEM snapshot, new for nearly every load, so such textures are keyed by their
+    // bytes and this instead of the address (ImportTexture).
+    uint64_t decode_hash = 0;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
     struct Hasher {
         size_t operator()(const TextureCacheKey& key) const noexcept {
+            // PORT: the content hash too. A buffer the game keeps rewriting (font pages, backgrounds, render
+            // targets) left up to the whole cache's entries for one address in one bucket chain, walked on every
+            // lookup (7.5% of the window thread on the AYN Thor).
             uintptr_t addr = (uintptr_t)key.texture_addr;
-            return (size_t)(addr ^ (addr >> 5));
+            size_t h = (size_t)(addr ^ (addr >> 5));
+            return h ^ (size_t)((key.content_hash ^ key.decode_hash) * 0x9E3779B97F4A7C15ull >> 7);
         }
     };
 };
@@ -225,6 +237,10 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+    // PORT: widescreen handling of 2D geometry (interpreter.cpp GfxSpTri1): from an orthographic projection, and the
+    // unsqueezed x of a vertex on the 4:3 frame's left or right edge (NAN otherwise)
+    bool ortho = false;
+    float x_edge = 0.0f;
 };
 
 struct RawTexMetadata {
@@ -282,6 +298,7 @@ struct RDP {
     } texture_to_load;
     struct {
         const uint8_t* addr;
+        const uint8_t* raw_addr; // PORT: the RDRAM address the load came from (addr points to the TMEM snapshot)
         uint32_t orig_size_bytes;
         uint32_t size_bytes;
         uint32_t full_image_line_size_bytes;
@@ -376,6 +393,10 @@ struct MaskedTextureEntry {
     uint8_t* replacementData;
 };
 
+// PORT: called on the render thread with the ids of each shader program drawn for the first time in this run (the
+// port records them for the warm-up of later runs: Interpreter::QueueShaderWarmup)
+extern void (*gPortShaderCreated)(uint64_t id0, uint64_t id1);
+
 class Interpreter {
   public:
     Interpreter();
@@ -395,6 +416,32 @@ class Interpreter {
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
+    // PORT: applies the persistent RSP/RDP state changes (segments, texture loads) of a frame that is not drawn.
+    bool TrackSegmentsOnly(Gfx* commands); // true: the frame renders off-screen and must be drawn
+    // PORT: frame interpolation (src/port/interp.cpp). True when the frame paints the whole screen (a full-screen fill
+    // rectangle into a frame buffer), so drawing it again shows the same picture whatever the frame buffer held before.
+    bool FrameRepaintsScreen(Gfx* commands);
+    // PORT: set while a display list is drawn again for an in-between frame: nothing is written back to game memory
+    // (render-target readback) and the frame-buffer draw stamps (CPU-drawn frame detection) stay as they are.
+    bool mReplayPass = false;
+    bool mReplayReadback = false; // the port reads this in-between frame back (screenshots of in-between frames)
+    // PORT: the RSP/RDP state persists from frame to frame (segments, TMEM, tiles, modes), and display lists rely on
+    // it. A display list drawn again must start from the state it first started from, and the next frame from the
+    // state it left. ReplayBegin: before the frame is first drawn; ReplayPassStart: before each repeat; ReplayEnd:
+    // after the last one (restores the state the first drawing left).
+    // restorePicture: the frame draws over the previous picture (menus): every game frame buffer it draws into is copied
+    // away before the first drawing and copied back before each repeat, so each picture starts from the same one and
+    // the last (exact) drawing leaves what the N64 would (CanRestorePicture: not with MSAA; PORT_INTERP_INCREMENTAL=0)
+    void ReplayBegin(bool restorePicture = false);
+    bool CanRestorePicture() const;
+    // the blend factor of the drawing (1: the exact frame, recorded; below 1: an in-between frame): textured and fill
+    // rectangles of the main picture are placed between their place in the last exact frame and this one (moving
+    // menu panels, cursors; PORT_INTERP_2D=0: off)
+    float mReplayT = 1.0f;
+    // before a frame's first in-between drawing: pairs its rectangles with the last exact drawing's (interpreter.cpp)
+    void Interp2DPrepare(Gfx* commands);
+    void ReplayPassStart();
+    void ReplayEnd();
     void EndFrame();
     void HandleWindowEvents();
     bool IsFrameReady();
@@ -423,10 +470,15 @@ class Interpreter {
     void SetResolutionMultiplier(float multiplier);
     void SetMsaaLevel(uint32_t level);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
+    // PORT: builds these shader programs before their first draw: on the backend's own thread when it has one
+    // (PrebuildShadersAsync), else on the render thread, a few milliseconds' worth per frame (WarmupStep)
+    void QueueShaderWarmup(std::vector<std::pair<uint64_t, uint64_t>> ids);
+    float ShaderWarmupProgress();
 
     // private: TODO make these private
     void Flush();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
+    void WarmupStep();
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void ShaderCacheClear();
     void TextureCacheClear();
@@ -491,6 +543,8 @@ class Interpreter {
     void GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry);
     void GfxDpSetZImage(void* zBufAddr);
     void GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address);
+    void RttInitialize(int id, uintptr_t address, uint32_t width, uint32_t height);
+    void RttReadback(); // PORT: copy the current render target's pixels back to its RDRAM buffer
     void GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t mode);
     void GfxDpSetOtherMode(uint32_t h, uint32_t l);
 
@@ -525,6 +579,8 @@ class Interpreter {
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
+    std::vector<std::pair<uint64_t, uint64_t>> mWarmupQueue; // PORT: QueueShaderWarmup, built by WarmupStep
+    size_t mWarmupNext = 0;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};
@@ -535,6 +591,7 @@ class Interpreter {
     XYWidthHeight mNativeDimensions{};     // gfx_native_dimensions;
     XYWidthHeight mPrevNativeDimensions{}; // gfx_prev_native_dimensions;
     uintptr_t mGfxFrameBuffer{};
+    int mGfxFrameBufferFb = -1; // PORT: the framebuffer whose texture mGfxFrameBuffer is (Fast3dGui::DrawGame: nearest sampling)
 
     unsigned int mMsaaLevel = 1;
     bool mDroppedFrame{};

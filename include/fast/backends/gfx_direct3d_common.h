@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include "gfx_rendering_api.h"
+#include "gfx_shader_cache.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
 
@@ -146,9 +147,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                      bool can_extract_depth) override;
     void StartDrawToFramebuffer(int fbId, float noiseScale) override;
+    void CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) override;
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    bool ClearFramebufferColor(float r, float g, float b, float a) override;
+    void InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
@@ -162,11 +166,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     ImTextureID GetTextureById(int id) override;
     /** @} */
 
-    PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
+    PFN_D3D11_CREATE_DEVICE mDX11CreateDevice = nullptr;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
     Microsoft::WRL::ComPtr<ID3D11Device> mDevice;
     GfxWindowBackendDXGI* mWindowBackend = nullptr;
-    D3D_FEATURE_LEVEL mFeatureLevel;
+    D3D_FEATURE_LEVEL mFeatureLevel = {};
 
     std::shared_ptr<Ship::ConsoleVariable> mConsoleVariable;
     std::shared_ptr<Ship::ResourceManager> mResourceManager;
@@ -175,15 +179,22 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
 
-    HMODULE mDX11Module;
+    std::vector<char> CompileShader(const std::string& source, const char* entry, const char* target,
+                                    UINT flags, bool useCache = true);
+    ShaderDiskCache mShaderCache;
+    HMODULE mDX11Module = nullptr;
 
-    HMODULE mCompilerModule;
-    pD3DCompile mD3dCompile;
+    HMODULE mCompilerModule = nullptr;
+    pD3DCompile mD3dCompile = nullptr;
 
-    uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
+    uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT] = {};
 
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
+    std::map<uint32_t, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> mDepthStencilStates;
+    std::map<uint32_t, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> mRasterizerStates;
+    static constexpr size_t kVertexRingSize = 4 * 1024 * 1024;
+    size_t mVertexRingOffset = kVertexRingSize;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
@@ -196,30 +207,30 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShader;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
     Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
-    size_t mCoordBufferSize;
+    size_t mCoordBufferSize = 0;
 
 #if DEBUG_D3D
     Microsoft::WRL::ComPtr<ID3D11Debug> debug;
 #endif
 
-    PerFrameCB mPerFrameCbData;
-    PerDrawCB mPerDrawCbData;
-    PerPrimDepthCB mPerPrimDepthCbData;
+    PerFrameCB mPerFrameCbData = {};
+    PerDrawCB mPerDrawCbData = {};
+    PerPrimDepthCB mPerPrimDepthCbData = {};
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 
     std::vector<struct TextureData> mTextures;
-    int mCurrentTile;
+    int mCurrentTile = 0;
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
 
     std::vector<FramebufferDX11> mFrameBuffers;
 
     // Current state
 
-    struct ShaderProgramD3D11* mShaderProgram;
+    struct ShaderProgramD3D11* mShaderProgram = nullptr;
 
-    int32_t mRenderTargetHeight;
-    int mCurrentFramebuffer;
+    int32_t mRenderTargetHeight = 0;
+    int mCurrentFramebuffer = 0;
     FilteringMode mCurrentFilterMode = FILTER_NONE;
 
     // Previous states (to prevent setting states needlessly)

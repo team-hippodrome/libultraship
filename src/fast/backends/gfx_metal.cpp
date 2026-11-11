@@ -7,8 +7,10 @@
 
 #ifdef __APPLE__
 
+#include <chrono>
 #include "fast/backends/gfx_metal.h"
 
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -33,6 +35,7 @@
 #include <spdlog/fmt/fmt.h>
 
 #include "fast/backends/gfx_metal_shader.h"
+#include "fast/backends/resize_keep.h"
 
 #include "libultraship/libultra/abi.h"
 #include "ship/config/ConsoleVariable.h"
@@ -42,6 +45,7 @@
 
 // MARK: - Helpers
 namespace Fast {
+extern bool gPortReplayFrame; // interpreter.cpp (frame interpolation)
 
 GfxRenderingAPIMetal::GfxRenderingAPIMetal(std::shared_ptr<Ship::ConsoleVariable> consoleVariable,
                                            std::shared_ptr<Ship::ResourceManager> resourceManager)
@@ -129,6 +133,112 @@ void GfxRenderingAPIMetal::RenderDrawData(ImDrawData* drawData) {
     ImGui_ImplMetal_RenderDrawData(drawData, framebuffer.mCommandBuffer, framebuffer.mCommandEncoder);
 }
 
+// PORT: imgui_impl_metal's pipeline (same shaders, vertex layout and blending) with a nearest-magnifying sampler, set
+// on ImGui's encoder by a draw callback before the game picture (Fast3dGui::DrawGame); ImDrawCallback_ResetRenderState
+// after the picture puts ImGui's own pipeline back. Made again when the screen's pixel formats or sample count change.
+void GfxRenderingAPIMetal::UseNearestSamplingForImGui() {
+    FramebufferMetal& framebuffer = mFramebuffers[0];
+    if (framebuffer.mCommandEncoder == nullptr || framebuffer.mRenderPassDescriptor == nullptr) {
+        return;
+    }
+    MTL::RenderPassDescriptor* pass = framebuffer.mRenderPassDescriptor;
+    MTL::Texture* color = pass->colorAttachments()->object(0)->texture();
+    if (color == nullptr) {
+        return;
+    }
+    MTL::Texture* depth = pass->depthAttachment() != nullptr ? pass->depthAttachment()->texture() : nullptr;
+    MTL::Texture* stencil = pass->stencilAttachment() != nullptr ? pass->stencilAttachment()->texture() : nullptr;
+    const MTL::PixelFormat depthFormat = depth != nullptr ? depth->pixelFormat() : MTL::PixelFormatInvalid;
+    const MTL::PixelFormat stencilFormat = stencil != nullptr ? stencil->pixelFormat() : MTL::PixelFormatInvalid;
+    const uint64_t key = ((uint64_t)color->pixelFormat() << 40) | ((uint64_t)depthFormat << 24) |
+                         ((uint64_t)stencilFormat << 8) | (uint64_t)color->sampleCount();
+    if (mImGuiNearestPipeline == nullptr || mImGuiNearestKey != key) {
+        static MTL::Function* sVertex = nullptr;
+        static MTL::Function* sFragment = nullptr;
+        if (sVertex == nullptr) {
+            static const char* source = R"(
+                #include <metal_stdlib>
+                using namespace metal;
+                struct Uniforms { float4x4 projectionMatrix; };
+                struct VertexIn {
+                    float2 position  [[attribute(0)]];
+                    float2 texCoords [[attribute(1)]];
+                    uchar4 color     [[attribute(2)]];
+                };
+                struct VertexOut { float4 position [[position]]; float2 texCoords; float4 color; };
+                vertex VertexOut imguiNearestVertex(VertexIn in [[stage_in]], constant Uniforms& uniforms [[buffer(1)]]) {
+                    VertexOut out;
+                    out.position = uniforms.projectionMatrix * float4(in.position, 0, 1);
+                    out.texCoords = in.texCoords;
+                    out.color = float4(in.color) / float4(255.0);
+                    return out;
+                }
+                fragment half4 imguiNearestFragment(VertexOut in [[stage_in]],
+                                                    texture2d<half, access::sample> texture [[texture(0)]]) {
+                    constexpr sampler nearestSampler(coord::normalized, min_filter::linear, mag_filter::nearest,
+                                                     mip_filter::linear);
+                    return half4(in.color) * texture.sample(nearestSampler, in.texCoords);
+                }
+            )";
+            NS::Error* error = nullptr;
+            MTL::Library* library =
+                mDevice->newLibrary(NS::String::string(source, NS::UTF8StringEncoding), nullptr, &error);
+            if (library == nullptr) {
+                SPDLOG_ERROR("Failed to compile the ImGui nearest shader: {}",
+                             error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+                return;
+            }
+            sVertex = library->newFunction(NS::String::string("imguiNearestVertex", NS::UTF8StringEncoding));
+            sFragment = library->newFunction(NS::String::string("imguiNearestFragment", NS::UTF8StringEncoding));
+            library->release();
+        }
+        MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
+        vd->attributes()->object(0)->setOffset(offsetof(ImDrawVert, pos));
+        vd->attributes()->object(0)->setFormat(MTL::VertexFormatFloat2);
+        vd->attributes()->object(0)->setBufferIndex(0);
+        vd->attributes()->object(1)->setOffset(offsetof(ImDrawVert, uv));
+        vd->attributes()->object(1)->setFormat(MTL::VertexFormatFloat2);
+        vd->attributes()->object(1)->setBufferIndex(0);
+        vd->attributes()->object(2)->setOffset(offsetof(ImDrawVert, col));
+        vd->attributes()->object(2)->setFormat(MTL::VertexFormatUChar4);
+        vd->attributes()->object(2)->setBufferIndex(0);
+        vd->layouts()->object(0)->setStepRate(1);
+        vd->layouts()->object(0)->setStepFunction(MTL::VertexStepFunctionPerVertex);
+        vd->layouts()->object(0)->setStride(sizeof(ImDrawVert));
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(sVertex);
+        desc->setFragmentFunction(sFragment);
+        desc->setVertexDescriptor(vd);
+        desc->setRasterSampleCount(color->sampleCount());
+        MTL::RenderPipelineColorAttachmentDescriptor* c0 = desc->colorAttachments()->object(0);
+        c0->setPixelFormat(color->pixelFormat());
+        c0->setBlendingEnabled(true);
+        c0->setRgbBlendOperation(MTL::BlendOperationAdd);
+        c0->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
+        c0->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        c0->setAlphaBlendOperation(MTL::BlendOperationAdd);
+        c0->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        c0->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        desc->setDepthAttachmentPixelFormat(depthFormat);
+        desc->setStencilAttachmentPixelFormat(stencilFormat);
+        NS::Error* error = nullptr;
+        MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
+        desc->release();
+        vd->release();
+        if (pipeline == nullptr) {
+            SPDLOG_ERROR("Failed to create the ImGui nearest pipeline: {}",
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+            return;
+        }
+        if (mImGuiNearestPipeline != nullptr) {
+            mImGuiNearestPipeline->release();
+        }
+        mImGuiNearestPipeline = pipeline;
+        mImGuiNearestKey = key;
+    }
+    framebuffer.mCommandEncoder->setRenderPipelineState(mImGuiNearestPipeline);
+}
+
 // MARK: - Metal Graphics Rendering API
 
 const char* GfxRenderingAPIMetal::GetName() {
@@ -175,9 +285,10 @@ void GfxRenderingAPIMetal::Init() {
                                     uint2 gid [[ thread_position_in_grid ]]) {
             uint index = gid.x + (inTexture.get_width() * gid.y);
             half4 pixel = inTexture.read(gid);
-            uint r = pixel.r * 0x1F;
-            uint g = pixel.g * 0x1F;
-            uint b = pixel.b * 0x1F;
+            // Recover the stored UNORM8 bits, then take the high five bits as the RDP does.
+            uint r = uint(round(float(pixel.r) * 255.0f)) >> 3;
+            uint g = uint(round(float(pixel.g) * 255.0f)) >> 3;
+            uint b = uint(round(float(pixel.b) * 255.0f)) >> 3;
             uint a = pixel.a > 0;
             outputBuffer[index] = (r << 11) | (g << 6) | (b << 1) | a;
         }
@@ -219,16 +330,30 @@ void GfxRenderingAPIMetal::ClearShaderCache() {
     }
 }
 
-struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+// PORT: one program's library, descriptor and pipeline, built on any thread (the render thread, or a warm-up worker)
+GfxRenderingAPIMetal::BuiltShader GfxRenderingAPIMetal::BuildShader(uint64_t shader_id0, uint64_t shader_id1,
+                                                                    bool three_point, bool srgb, uint32_t msaa_level) {
+    // gfx_metal_build_shader keeps its state in statics
+    static std::mutex sSourceMutex;
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
-    size_t numFloats = 0;
+    BuiltShader built;
+    built.threePoint = three_point;
+    built.srgb = srgb;
+    built.msaaLevel = msaa_level;
     std::string buf;
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
-    MTL::VertexDescriptor* vertex_descriptor =
-        gfx_metal_build_shader(buf, numFloats, cc_features, mCurrentFilterMode == FILTER_THREE_POINT);
+    MTL::VertexDescriptor* vertex_descriptor;
+    {
+        std::lock_guard<std::mutex> lock(sSourceMutex);
+        vertex_descriptor = gfx_metal_build_shader(buf, built.numFloats, cc_features, three_point);
+    }
+    // debug: PORT_SHADER_SALT=<text> makes every source new to the Metal cache (measures cold builds)
+    if (const char* salt = getenv("PORT_SHADER_SALT")) {
+        buf += std::string("\n// ") + salt + "\n";
+    }
 
     NS::Error* error = nullptr;
     MTL::Library* library =
@@ -246,17 +371,23 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     pipeline_descriptor->setFragmentFunction(fragmentFunc);
     pipeline_descriptor->setVertexDescriptor(vertex_descriptor);
 
-    pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB
+    pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(srgb ? MTL::PixelFormatBGRA8Unorm_sRGB
                                                                                  : MTL::PixelFormatBGRA8Unorm);
     pipeline_descriptor->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
     if (cc_features.opt_alpha) {
         pipeline_descriptor->colorAttachments()->object(0)->setBlendingEnabled(true);
-        pipeline_descriptor->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
+        // PORT: dual-source (default.shader.metal): RGB = src * a + dst * (1 - a) with a = color1.a; alpha = coverage
+        // (color.a: 1, or 0 for o_invisible draws, which keep the old alpha). Was alpha = dst: in a render-to-texture
+        // image cleared to transparent, translucent or alpha-0 texels stayed invisible where the N64 shows them.
+        static const bool sOldAlphaBlend = getenv("PORT_OLD_ALPHA_BLEND") != nullptr; // debug: alpha = dst
+        pipeline_descriptor->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSource1Alpha);
         pipeline_descriptor->colorAttachments()->object(0)->setDestinationRGBBlendFactor(
-            MTL::BlendFactorOneMinusSourceAlpha);
+            MTL::BlendFactorOneMinusSource1Alpha);
         pipeline_descriptor->colorAttachments()->object(0)->setRgbBlendOperation(MTL::BlendOperationAdd);
-        pipeline_descriptor->colorAttachments()->object(0)->setSourceAlphaBlendFactor(MTL::BlendFactorZero);
-        pipeline_descriptor->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
+        pipeline_descriptor->colorAttachments()->object(0)->setSourceAlphaBlendFactor(
+            sOldAlphaBlend ? MTL::BlendFactorZero : MTL::BlendFactorOne);
+        pipeline_descriptor->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(
+            sOldAlphaBlend ? MTL::BlendFactorOne : MTL::BlendFactorOneMinusSourceAlpha);
         pipeline_descriptor->colorAttachments()->object(0)->setAlphaBlendOperation(MTL::BlendOperationAdd);
         pipeline_descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
     } else {
@@ -264,6 +395,61 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
         pipeline_descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
     }
 
+    // PORT: only the window's msaa level now; other levels when first used (PipelineFor)
+    pipeline_descriptor->setSampleCount(msaa_level);
+    error = nullptr;
+    built.pipeline = mDevice->newRenderPipelineState(pipeline_descriptor, &error);
+    if (!built.pipeline || error != nullptr) {
+        SPDLOG_ERROR("Failed to create pipeline state, error {}",
+                     error->localizedDescription()->cString(NS::UTF8StringEncoding));
+    }
+    built.descriptor = pipeline_descriptor; // keeps the alloc's reference
+
+    vertexFunc->release();
+    fragmentFunc->release();
+    library->release();
+    autorelease_pool->release();
+    return built;
+}
+
+struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    // PORT_TRACE_PACING=1 or PORT_TRACE_SHADERS=1: how long each new shader took (a draw waits for it)
+    static const bool sTraceShaders = getenv("PORT_TRACE_PACING") != nullptr || getenv("PORT_TRACE_SHADERS") != nullptr;
+    auto buildStart = std::chrono::steady_clock::now();
+    bool three_point = mCurrentFilterMode == FILTER_THREE_POINT;
+    uint32_t msaa_level = std::clamp<uint32_t>(mFramebuffers[0].mMsaaLevel, 1, 8);
+    auto key = std::make_pair(shader_id0, shader_id1);
+
+    // a program the warm-up built (or is building: wait for it, it is further along than a new build here)
+    BuiltShader built;
+    const char* how = "built";
+    {
+        std::unique_lock<std::mutex> lock(mPrebuildMutex);
+        mPrebuildCond.wait(lock, [&] { return mPrebuilding.count(key) == 0; });
+        auto it = mPrebuilt.find(key);
+        if (it != mPrebuilt.end()) {
+            built = it->second;
+            mPrebuilt.erase(it);
+            how = "prebuilt";
+        } else {
+            mPrebuildSkip.insert(key);
+        }
+    }
+    if (built.descriptor != nullptr && (built.threePoint != three_point || built.srgb != mSrgbMode)) {
+        // built for other settings (the filter changed since)
+        built.descriptor->release();
+        if (built.pipeline != nullptr) {
+            built.pipeline->release();
+        }
+        built = {};
+    }
+    if (built.descriptor == nullptr) {
+        built = BuildShader(shader_id0, shader_id1, three_point, mSrgbMode, msaa_level);
+        how = "built";
+    }
+
+    CCFeatures cc_features;
+    gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
     struct ShaderProgramMetal* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
     prg->shader_id0 = shader_id0;
     prg->shader_id1 = shader_id1;
@@ -274,37 +460,99 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
     prg->numInputs = cc_features.numInputs;
-    prg->numFloats = numFloats;
-
-    // Prepoluate pipeline state cache with program and available msaa levels
-    for (int i = 0; i < ARRAY_COUNT(mMsaaNumQualityLevels); i++) {
-        if (mMsaaNumQualityLevels[i] == 1) {
-            int msaa_level = i + 1;
-            pipeline_descriptor->setSampleCount(msaa_level);
-            MTL::RenderPipelineState* pipeline_state = mDevice->newRenderPipelineState(pipeline_descriptor, &error);
-
-            if (!pipeline_state || error != nullptr) {
-                // Pipeline State creation could fail if we haven't properly set up our pipeline descriptor.
-                // If the Metal API validation is enabled, we can find out more information about what
-                // went wrong.  (Metal API validation is enabled by default when a debug build is run
-                // from Xcode)
-                SPDLOG_ERROR("Failed to create pipeline state, error {}",
-                             error->localizedDescription()->cString(NS::UTF8StringEncoding));
-            }
-
-            prg->pipeline_state_variants[msaa_level] = pipeline_state;
-        }
-    }
+    prg->numFloats = built.numFloats;
+    prg->pipeline_descriptor = built.descriptor;
+    prg->pipeline_state_variants[built.msaaLevel] = built.pipeline;
+    PipelineFor(prg, mFramebuffers[0].mMsaaLevel);
 
     LoadShader((struct ShaderProgram*)prg);
 
-    vertexFunc->release();
-    fragmentFunc->release();
-    library->release();
-    pipeline_descriptor->release();
-    autorelease_pool->release();
-
+    if (sTraceShaders) {
+        fprintf(stderr, "[shader] %016llx/%016llx %s in %.1f ms\n", (unsigned long long)shader_id0,
+                (unsigned long long)shader_id1, how,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
+    }
     return (struct ShaderProgram*)prg;
+}
+
+// PORT: shader warm-up: builds the programs on worker threads; CreateAndLoadNewShader takes them
+bool GfxRenderingAPIMetal::PrebuildShadersAsync(const std::vector<std::pair<uint64_t, uint64_t>>& ids) {
+    std::lock_guard<std::mutex> lock(mPrebuildMutex);
+    mPrebuildQueue.insert(mPrebuildQueue.end(), ids.begin(), ids.end());
+    mPrebuildThreePoint = mCurrentFilterMode == FILTER_THREE_POINT;
+    mPrebuildSrgb = mSrgbMode;
+    mPrebuildMsaa = std::clamp<uint32_t>(mFramebuffers.empty() ? 1 : mFramebuffers[0].mMsaaLevel, 1, 8);
+    if (mPrebuildThreads.empty() && !ids.empty()) {
+        // the Metal compiler runs in its own processes: a few builds at a time finish sooner (cold, on 10 cores: 111
+        // programs in 35 s with one thread, 13 s with 4, 8.5 s with 8)
+        unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+        if (const char* threads = getenv("PORT_SHADER_THREADS")) { // debug: the number of builder threads
+            n = std::clamp(atoi(threads), 1, 32);
+        }
+        mPrebuildStart = std::chrono::steady_clock::now();
+        mPrebuildRunning = n;
+        for (unsigned i = 0; i < n; i++) {
+            mPrebuildThreads.emplace_back([this] { PrebuildWorker(); });
+        }
+    }
+    return true;
+}
+
+float GfxRenderingAPIMetal::ShaderPrebuildProgress() {
+    std::lock_guard<std::mutex> lock(mPrebuildMutex);
+    if (mPrebuildQueue.empty()) return 1.0f;
+    return float(mPrebuildNext - mPrebuilding.size()) / float(mPrebuildQueue.size());
+}
+
+void GfxRenderingAPIMetal::PrebuildWorker() {
+    static const bool sTrace = getenv("PORT_TRACE_PACING") != nullptr || getenv("PORT_TRACE_SHADERS") != nullptr;
+    std::unique_lock<std::mutex> lock(mPrebuildMutex);
+    while (!mPrebuildStop && mPrebuildNext < mPrebuildQueue.size()) {
+        auto key = mPrebuildQueue[mPrebuildNext++];
+        if (mPrebuildSkip.count(key) || mPrebuilt.count(key) || mPrebuilding.count(key)) {
+            continue;
+        }
+        mPrebuilding.insert(key);
+        bool three_point = mPrebuildThreePoint, srgb = mPrebuildSrgb;
+        uint32_t msaa = mPrebuildMsaa;
+        lock.unlock();
+        BuiltShader built = BuildShader(key.first, key.second, three_point, srgb, msaa);
+        lock.lock();
+        mPrebuilding.erase(key);
+        mPrebuilt[key] = built;
+        mPrebuildBuilt++;
+        mPrebuildCond.notify_all();
+    }
+    if (--mPrebuildRunning == 0 && sTrace) {
+        fprintf(stderr, "[shader] warm-up done: %zu programs queued, %zu built ahead, in %.0f ms\n",
+                mPrebuildQueue.size(), mPrebuildBuilt,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mPrebuildStart).count());
+    }
+}
+
+GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    mPrebuildStop = true;
+    for (auto& t : mPrebuildThreads) {
+        t.join();
+    }
+}
+
+// PORT: the program's pipeline for an msaa level, built on first use
+MTL::RenderPipelineState* GfxRenderingAPIMetal::PipelineFor(ShaderProgramMetal* prg, int msaa_level) {
+    if (msaa_level < 1 || msaa_level > 8) {
+        msaa_level = 1;
+    }
+    if (prg->pipeline_state_variants[msaa_level] == nullptr && prg->pipeline_descriptor != nullptr) {
+        NS::Error* error = nullptr;
+        prg->pipeline_descriptor->setSampleCount(msaa_level);
+        MTL::RenderPipelineState* pipeline_state = mDevice->newRenderPipelineState(prg->pipeline_descriptor, &error);
+        if (!pipeline_state || error != nullptr) {
+            SPDLOG_ERROR("Failed to create pipeline state, error {}",
+                         error->localizedDescription()->cString(NS::UTF8StringEncoding));
+        }
+        prg->pipeline_state_variants[msaa_level] = pipeline_state;
+    }
+    return prg->pipeline_state_variants[msaa_level];
 }
 
 struct ShaderProgram* GfxRenderingAPIMetal::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
@@ -546,8 +794,7 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     if (current_framebuffer.mLastShaderProgram != mShaderProgram) {
         current_framebuffer.mLastShaderProgram = mShaderProgram;
 
-        MTL::RenderPipelineState* pipeline_state =
-            mShaderProgram->pipeline_state_variants[current_framebuffer.mMsaaLevel];
+        MTL::RenderPipelineState* pipeline_state = PipelineFor(mShaderProgram, current_framebuffer.mMsaaLevel);
         current_framebuffer.mCommandEncoder->setRenderPipelineState(pipeline_state);
     }
 
@@ -601,7 +848,7 @@ void GfxRenderingAPIMetal::EndFrame() {
     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,
     // no TBDR tile flush/reload).  The CPU reads this buffer next frame in
     // ReadFramebufferToCPU and converts BGRA8 → RGBA5551 on the CPU side.
-    if (mScreenReadbackRequested) {
+    if (mScreenReadbackRequested && !gPortReplayFrame) {
         MTL::Texture* screenTex = mTextures[screen_framebuffer.mTextureId].texture;
         uint32_t w = mScreenReadbackWidth;
         uint32_t h = mScreenReadbackHeight;
@@ -631,7 +878,9 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     // Now that commit has been called, retain the command buffer for GPU sync
     // in ReadFramebufferToCPU next frame (waitUntilCompleted before reading).
-    if (mScreenReadbackBuffer && !mScreenReadbackDataReady) {
+    if (gPortReplayFrame) {
+        // PORT: an in-between frame (frame interpolation): readback state left for the next real frame
+    } else if (mScreenReadbackBuffer && !mScreenReadbackDataReady) {
         mScreenReadbackCmdBuf = screen_framebuffer.mCommandBuffer->retain();
         mScreenReadbackDataReady = true;
     } else if (mScreenReadbackDataReady && mScreenReadbackCmdBuf) {
@@ -751,6 +1000,101 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
     autorelease_pool->release();
 }
 
+// PORT: framebuffers whose colour texture was just (re)created: their contents are undefined (often leftover GPU
+// memory). The game draws some frames incrementally (fades only add a translucent layer over the previous picture), so
+// the first pass into such a texture clears it to black, as an untouched N64 frame buffer would read.
+static std::unordered_set<int> sFreshColorFbs;
+
+// PORT: the old picture drawn into a resized framebuffer's new texture (fast/backends/resize_keep.h)
+static MTL::RenderPipelineState* ResizeCopyPipeline(MTL::Device* device, MTL::PixelFormat format, uint32_t samples) {
+    static std::unordered_map<uint64_t, MTL::RenderPipelineState*> sPipelines;
+    static MTL::Function* sVertex = nullptr;
+    static MTL::Function* sFragment = nullptr;
+    uint64_t key = ((uint64_t)format << 8) | samples;
+    if (auto it = sPipelines.find(key); it != sPipelines.end()) {
+        return it->second;
+    }
+    if (sVertex == nullptr) {
+        static const char* source = R"(
+            #include <metal_stdlib>
+            using namespace metal;
+            struct CopyOut { float4 pos [[position]]; float2 uv; };
+            vertex CopyOut resizeCopyVertex(uint vid [[vertex_id]], constant float4& rect [[buffer(0)]]) {
+                float2 corner = float2(vid & 1, vid >> 1); // triangle strip over the destination rectangle
+                CopyOut out;
+                out.pos = float4(mix(rect.xy, rect.zw, corner), 0.0, 1.0);
+                out.uv = corner;
+                return out;
+            }
+            fragment float4 resizeCopyFragment(CopyOut in [[stage_in]], texture2d<float> src [[texture(0)]]) {
+                constexpr sampler linearSampler(filter::linear, address::clamp_to_edge);
+                return src.sample(linearSampler, in.uv);
+            }
+        )";
+        NS::Error* error = nullptr;
+        MTL::Library* library = device->newLibrary(NS::String::string(source, NS::UTF8StringEncoding), nullptr, &error);
+        if (library == nullptr) {
+            SPDLOG_ERROR("Failed to compile the resize copy shader: {}",
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+            return nullptr;
+        }
+        sVertex = library->newFunction(NS::String::string("resizeCopyVertex", NS::UTF8StringEncoding));
+        sFragment = library->newFunction(NS::String::string("resizeCopyFragment", NS::UTF8StringEncoding));
+        library->release();
+    }
+    MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    desc->setVertexFunction(sVertex);
+    desc->setFragmentFunction(sFragment);
+    desc->colorAttachments()->object(0)->setPixelFormat(format);
+    desc->setSampleCount(samples);
+    NS::Error* error = nullptr;
+    MTL::RenderPipelineState* pipeline = device->newRenderPipelineState(desc, &error);
+    desc->release();
+    if (pipeline == nullptr) {
+        SPDLOG_ERROR("Failed to create the resize copy pipeline: {}",
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "?");
+    }
+    sPipelines[key] = pipeline;
+    return pipeline;
+}
+
+static bool DrawOldPictureScaled(MTL::Device* device, MTL::CommandQueue* queue, MTL::Texture* oldTex,
+                                 MTL::Texture* newTex, MTL::Texture* newMsaaTex, uint32_t msaa) {
+    MTL::RenderPipelineState* pipeline = ResizeCopyPipeline(device, newTex->pixelFormat(), msaa > 1 ? msaa : 1);
+    if (pipeline == nullptr) {
+        return false;
+    }
+    const float nw = (float)newTex->width(), nh = (float)newTex->height();
+    PortResizeKeepRect r = PortResizeKeepDest((float)oldTex->width(), (float)oldTex->height(), nw, nh);
+    // destination rectangle in clip space (y up; texture rows run down)
+    float rect[4] = { r.x0 / nw * 2.0f - 1.0f, 1.0f - r.y0 / nh * 2.0f, r.x1 / nw * 2.0f - 1.0f, 1.0f - r.y1 / nh * 2.0f };
+
+    MTL::RenderPassDescriptor* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    if (msaa > 1 && newMsaaTex != nullptr) {
+        color->setTexture(newMsaaTex);
+        color->setResolveTexture(newTex);
+        color->setStoreAction(MTL::StoreActionStoreAndMultisampleResolve);
+    } else {
+        color->setTexture(newTex);
+        color->setStoreAction(MTL::StoreActionStore);
+    }
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
+
+    MTL::CommandBuffer* cb = queue->commandBuffer();
+    MTL::RenderCommandEncoder* enc = cb->renderCommandEncoder(pass);
+    enc->setRenderPipelineState(pipeline);
+    enc->setVertexBytes(rect, sizeof(rect), 0);
+    enc->setFragmentTexture(oldTex, 0);
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4));
+    enc->endEncoding();
+    cb->commit();
+    // resizes are rare: wait, so the old texture can go and no later pass (on either queue) runs before the copy
+    cb->waitUntilCompleted();
+    return true;
+}
+
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                        bool can_extract_depth) {
@@ -787,8 +1131,15 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
         tex_descriptor->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
         tex_descriptor->setUsage((render_target ? MTL::TextureUsageRenderTarget : 0) | MTL::TextureUsageShaderRead);
 
-        if (tex.texture != nullptr)
+        // PORT: a rendered picture of another size is drawn into the new texture (DrawOldPictureScaled)
+        MTL::Texture* old_texture = nullptr;
+        if (render_target && fb.mRenderPassDescriptor != nullptr && tex.texture != nullptr && PortResizeKeepEnabled() &&
+            (tex.width != width || tex.height != height) && tex.width > 1 && tex.height > 1 &&
+            tex.texture->pixelFormat() == tex_descriptor->pixelFormat()) {
+            old_texture = tex.texture;
+        } else if (tex.texture != nullptr) {
             tex.texture->release();
+        }
 
         tex.texture = mDevice->newTexture(tex_descriptor);
 
@@ -801,6 +1152,18 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             if (tex.msaaTexture != nullptr)
                 tex.msaaTexture->release();
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
+        }
+
+        bool kept = old_texture != nullptr && DrawOldPictureScaled(mDevice, mCommandQueue, old_texture, tex.texture,
+                                                                   msaa_level > 1 ? tex.msaaTexture : nullptr,
+                                                                   msaa_level);
+        if (old_texture != nullptr) {
+            old_texture->release();
+        }
+        if (render_target && !kept) {
+            sFreshColorFbs.insert(fb_id);
+        } else if (kept) {
+            sFreshColorFbs.erase(fb_id);
         }
 
         if (render_target) {
@@ -905,7 +1268,18 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
             fb.mCommandBuffer->enqueue();
         }
 
+        MTL::RenderPassColorAttachmentDescriptor* color0 = fb.mRenderPassDescriptor->colorAttachments()->object(0);
+        static const bool sNoFreshClear = getenv("PORT_NO_FRESH_CLEAR") != nullptr; // debug: old behaviour
+        bool fresh = sFreshColorFbs.erase(fb_id) != 0 && !sNoFreshClear;
+        MTL::LoadAction loadAction = color0->loadAction();
+        if (fresh) {
+            color0->setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
+            color0->setLoadAction(MTL::LoadActionClear);
+        }
         fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
+        if (fresh) {
+            color0->setLoadAction(loadAction);
+        }
         std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder", fb_id);
         fb.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
         fb.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
@@ -969,6 +1343,19 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
     framebuffer.mLastDepthTest = -1;
     framebuffer.mLastDepthMask = -1;
     framebuffer.mLastZmodeDecal = -1;
+}
+
+bool GfxRenderingAPIMetal::ClearFramebufferColor(float r, float g, float b, float a) {
+    auto& framebuffer = mFramebuffers[mCurrentFramebuffer];
+    if (mCurrentFramebuffer == 0 || framebuffer.mCommandEncoder == nullptr || framebuffer.mRenderPassDescriptor == nullptr) {
+        return false;
+    }
+    MTL::RenderPassColorAttachmentDescriptor* color0 = framebuffer.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::ClearColor saved = color0->clearColor();
+    color0->setClearColor(MTL::ClearColor::Make(r, g, b, a));
+    ClearFramebuffer(true, false);
+    color0->setClearColor(saved);
+    return true;
 }
 
 void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1109,6 +1496,68 @@ void GfxRenderingAPIMetal::SelectTextureFb(int fb_id) {
     SelectTexture(tile, mFramebuffers[fb_id].mTextureId);
 }
 
+// PORT: the copy goes into streamFb's command buffer, between what was drawn into it so far and what comes next
+void GfxRenderingAPIMetal::CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) {
+    if (streamFb >= (int)mFramebuffers.size() || dstFb >= (int)mFramebuffers.size() ||
+        srcFb >= (int)mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& stream = mFramebuffers[streamFb];
+    if (stream.mCommandBuffer == nullptr || stream.mCommandEncoder == nullptr) {
+        StartDrawToFramebuffer(streamFb, 0.0f);
+    }
+    if (stream.mCommandBuffer == nullptr || stream.mCommandEncoder == nullptr) {
+        return;
+    }
+    const TextureDataMetal& srcTex = mTextures[mFramebuffers[srcFb].mTextureId];
+    const TextureDataMetal& dstTex = mTextures[mFramebuffers[dstFb].mTextureId];
+    MTL::Texture* src = srcTex.texture;
+    MTL::Texture* dst = dstTex.texture;
+    if (src == nullptr || dst == nullptr) {
+        return;
+    }
+    const NS::UInteger cw = std::min<NS::UInteger>({ (NS::UInteger)w, src->width(), dst->width() });
+    const NS::UInteger ch = std::min<NS::UInteger>({ (NS::UInteger)h, src->height(), dst->height() });
+    // with MSAA the picture lives in the multisampled texture (loaded by every pass, resolved into the plain one): copied
+    // whole when both framebuffers have one of the same size and sample count
+    MTL::Texture* srcMs = mFramebuffers[srcFb].mMsaaLevel > 1 ? srcTex.msaaTexture : nullptr;
+    MTL::Texture* dstMs = mFramebuffers[dstFb].mMsaaLevel > 1 ? dstTex.msaaTexture : nullptr;
+    const bool copyMs = srcMs != nullptr && dstMs != nullptr && srcMs->sampleCount() == dstMs->sampleCount() &&
+                        srcMs->width() == dstMs->width() && srcMs->height() == dstMs->height();
+    stream.mCommandEncoder->endEncoding();
+    MTL::BlitCommandEncoder* blit = stream.mCommandBuffer->blitCommandEncoder();
+    blit->copyFromTexture(src, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(cw, ch, 1), dst, 0, 0, MTL::Origin(0, 0, 0));
+    if (copyMs) {
+        blit->copyFromTexture(srcMs, dstMs);
+    }
+    blit->endEncoding();
+    // a new render encoder that keeps what the framebuffer holds (as CopyFramebuffer)
+    MTL::RenderPassColorAttachmentDescriptor* color0 = stream.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::LoadAction colorLoad = color0->loadAction();
+    color0->setLoadAction(MTL::LoadActionLoad);
+    MTL::RenderPassDepthAttachmentDescriptor* depth = stream.mRenderPassDescriptor->depthAttachment();
+    MTL::LoadAction depthLoad = MTL::LoadActionDontCare;
+    if (stream.mHasDepthBuffer) {
+        depthLoad = depth->loadAction();
+        depth->setLoadAction(MTL::LoadActionLoad);
+    }
+    stream.mCommandEncoder = stream.mCommandBuffer->renderCommandEncoder(stream.mRenderPassDescriptor);
+    stream.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
+    stream.mCommandEncoder->setViewport(*stream.mViewport);
+    stream.mCommandEncoder->setScissorRect(*stream.mScissorRect);
+    color0->setLoadAction(colorLoad);
+    if (stream.mHasDepthBuffer) {
+        depth->setLoadAction(depthLoad);
+    }
+    stream.mHasBoundVertexShader = false;
+    stream.mHasBoundFragShader = false;
+    stream.mLastShaderProgram = nullptr;
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        stream.mLastBoundTextures[i] = nullptr;
+        stream.mLastBoundSamplers[i] = nullptr;
+    }
+}
+
 void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
                                            int dstX0, int dstY0, int dstX1, int dstY1) {
     if (fb_src_id >= (int)mFramebuffers.size() || fb_dst_id >= (int)mFramebuffers.size()) {
@@ -1182,6 +1631,34 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     source_framebuffer.mLastZmodeDecal = -1;
 }
 
+extern std::vector<uint8_t> gPortScreenBgra; // interpreter.cpp
+extern uint32_t gPortScreenW, gPortScreenH;
+
+void GfxRenderingAPIMetal::InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) {
+    auto& fb = mFramebuffers.at(fbId);
+    auto* texture = mTextures[fb.mTextureId].texture;
+    const size_t rowBytes = ((size_t)width * 4 + 255) & ~size_t(255);
+    auto* staging = mDevice->newBuffer(rowBytes * height, MTL::ResourceStorageModeShared);
+    auto* bytes = static_cast<uint8_t*>(staging->contents());
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const auto* src = rgba + ((size_t)y * width + x) * 4;
+            auto* dst = bytes + y * rowBytes + x * 4;
+            dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = src[3];
+        }
+    }
+    auto* command = mReadbackQueue->commandBuffer();
+    auto* blit = command->blitCommandEncoder();
+    blit->copyFromBuffer(staging, 0, rowBytes, rowBytes * height, MTL::Size(width, height, 1),
+                         texture, 0, 0, MTL::Origin(0, 0, 0));
+    blit->endEncoding();
+    command->commit();
+    command->waitUntilCompleted();
+    staging->release();
+    sFreshColorFbs.erase(fbId);
+    fb.mRenderPassDescriptor->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionLoad);
+}
+
 void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
     if (fb_id >= (int)mFramebuffers.size()) {
         return;
@@ -1202,6 +1679,10 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
 
             uint8_t* bgra = (uint8_t*)mScreenReadbackBuffer->contents();
             uint32_t count = mScreenReadbackWidth * mScreenReadbackHeight;
+            // PORT: keep the full 8-bit pixels too, for screenshots (the RGBA5551 below quantises gradients)
+            gPortScreenBgra.assign(bgra, bgra + (size_t)count * 4);
+            gPortScreenW = mScreenReadbackWidth;
+            gPortScreenH = mScreenReadbackHeight;
             for (uint32_t i = 0; i < count; i++) {
                 uint8_t b = bgra[i * 4 + 0];
                 uint8_t g = bgra[i * 4 + 1];
@@ -1217,6 +1698,9 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         mScreenReadbackHeight = height;
     } else {
         // Custom Framebuffer: synchronous readback via readback queue
+        if (framebuffer.mCommandBuffer == nullptr) { // PORT: nothing drawn into it this frame: leave the buffer as is
+            return;
+        }
         if (framebuffer.mCommandEncoder && !framebuffer.mHasEndedEncoding) {
             framebuffer.mCommandEncoder->endEncoding();
         }
@@ -1264,6 +1748,16 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         framebuffer.mCommandEncoder = nullptr;
         framebuffer.mHasEndedEncoding = false;
         mDrawnFramebuffers.erase(fb_id);
+    }
+}
+
+// PORT: a render-to-texture target is read back whenever the game stops drawing into it. Its passes go to the readback
+// queue from the start: the first pass on the main queue would only run after the frame's own command buffers (enqueued
+// earlier, committed at the end of the frame), so a later pass on the readback queue (drawn and read back right away)
+// ran before it, and the first pass's clear then wiped what the later one drew (the Pokémon pictures on the VS screen).
+void GfxRenderingAPIMetal::SetFramebufferReadback(int fb_id) {
+    if (fb_id > 0 && fb_id < (int)mFramebuffers.size() && mFramebuffers[fb_id].mCommandBuffer == nullptr) {
+        mFramebuffers[fb_id].mUseReadbackQueue = true;
     }
 }
 

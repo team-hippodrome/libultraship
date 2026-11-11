@@ -15,6 +15,7 @@
 #include "ship/debug/CrashHandler.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/AppleFolderManager.h"
+#include "ship/utils/AppDirectory.h"
 #include "ship/window/FileDrop.h"
 #include "ship/log/Logger.h"
 #include "ship/thread/ThreadPool.h"
@@ -316,51 +317,27 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(const std::string& appName) {
+    auto env = [](const char* name) {
+        const char* value = SDL_GetEnvironmentVariable(SDL_GetEnvironment(), name);
+        return value != nullptr ? std::string(value) : std::string();
+    };
+    const char* base = SDL_GetBasePath();
+    std::filesystem::path sandbox, image;
+    bool macBundle = false;
 #if defined(__ANDROID__)
-    const char* externaldir = SDL_GetAndroidExternalStoragePath();
-    if (externaldir != NULL) {
-        return externaldir;
-    }
+    if (const char* files = SDL_GetAndroidExternalStoragePath()) sandbox = std::filesystem::u8path(files);
+    else if (const char* files = SDL_GetAndroidInternalStoragePath()) sandbox = std::filesystem::u8path(files);
+#elif defined(__IOS__)
+    sandbox = std::filesystem::u8path(env("HOME")) / "Documents";
+#elif defined(__APPLE__)
+    macBundle = true;
+#elif defined(__linux__)
+    image = std::filesystem::u8path(env("APPIMAGE"));
 #endif
-
-#ifdef __IOS__
-    const char* home = getenv("HOME");
-    return std::string(home) + "/Documents";
-#endif
-
-#if defined(__APPLE__)
-    FolderManager foldermanager;
-    if (char* fpath = std::getenv("SHIP_HOME")) {
-        const char* appBundleID = strrchr(fpath, '/');
-        if (appBundleID != nullptr) {
-            foldermanager.CreateAppSupportDirectory(appBundleID + 1);
-        }
-        if (fpath[0] == '~') {
-            const char* home = getenv("HOME") ? getenv("HOME") : getpwuid(getuid())->pw_dir;
-            return std::string(home) + std::string(fpath).substr(1);
-        }
-        return std::string(fpath);
-    }
-#endif
-
-#if defined(__linux__)
-    char* fpath = std::getenv("SHIP_HOME");
-    if (fpath != NULL) {
-        return std::string(fpath);
-    }
-#endif
-
-#ifdef NON_PORTABLE
-    const std::string effectiveAppName = appName.empty() ? "libultraship" : appName;
-    char* prefpath = SDL_GetPrefPath(NULL, effectiveAppName.c_str());
-    if (prefpath != NULL) {
-        std::string ret(prefpath);
-        SDL_free(prefpath);
-        return ret;
-    }
-#endif
-
-    return ".";
+    const auto home = std::filesystem::u8path(env("HOME").empty() ? env("USERPROFILE") : env("HOME"));
+    const auto directory = ResolveAppDirectory(base ? std::filesystem::u8path(base) : std::filesystem::path(),
+                                               env("SHIP_HOME"), home, image, sandbox, macBundle).u8string();
+    return {directory.begin(), directory.end()};
 }
 
 std::string Context::GetPathRelativeToAppBundle(const std::string& path) {

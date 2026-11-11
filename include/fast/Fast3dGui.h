@@ -44,6 +44,9 @@ typedef struct {
             SDL_Renderer* Renderer; ///< SDL_Renderer* (for Metal layer)
         } Metal;
         struct {
+            void* Window; ///< SDL_Window* (PORT: Vulkan backend)
+        } Vulkan;
+        struct {
             uint32_t Width;  ///< Framebuffer width in pixels.
             uint32_t Height; ///< Framebuffer height in pixels.
         } Gx2;
@@ -177,6 +180,11 @@ class Fast3dGui : public Ship::Gui {
      * @return Scaling multiplier (1 = native, 2 = 2×, etc.).
      */
     int16_t GetIntegerScaleFactor();
+
+  public:
+    // PORT: switches ImGui's renderer to nearest magnification for the draws that follow (the game picture's sharp
+    // upscale, DrawGame; called from an ImGui draw callback). Vulkan takes a second texture id instead.
+    void UseNearestSamplingForImGui();
 
     std::unordered_map<std::string, Ship::GuiTextureMetadata> mGuiTextures; ///< Cached GPU texture registry.
 };

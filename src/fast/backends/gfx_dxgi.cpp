@@ -34,6 +34,7 @@
 #include "fast/backends/gfx_screen_config.h"
 #include "fast/interpreter.h"
 #include "fast/Fast3dGui.h"
+#include "spdlog/spdlog.h"
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
@@ -405,10 +406,6 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             RECT* const prcNewWindow = (RECT*)l_param;
             SetWindowPos(h_wnd, NULL, prcNewWindow->left, prcNewWindow->top, prcNewWindow->right - prcNewWindow->left,
                          prcNewWindow->bottom - prcNewWindow->top, SWP_NOZORDER | SWP_NOACTIVATE);
-            self->mPosX = prcNewWindow->left;
-            self->mPosY = prcNewWindow->top;
-            self->current_width = prcNewWindow->right - prcNewWindow->left;
-            self->current_height = prcNewWindow->bottom - prcNewWindow->top;
             break;
         }
         case WM_ENDSESSION:
@@ -1128,6 +1125,7 @@ bool GfxWindowBackendDXGI::IsFullscreen() {
 void ThrowIfFailed(HRESULT res) {
     if (FAILED(res)) {
         fprintf(stderr, "Error: 0x%08X\n", res);
+        SPDLOG_CRITICAL("HRESULT failed: 0x{:08X}", (uint32_t)res);
         throw Ship::HResultException(res);
     }
 }
@@ -1136,6 +1134,7 @@ void ThrowIfFailed(HRESULT res, HWND h_wnd, const char* message) {
     if (FAILED(res)) {
         char full_message[256];
         snprintf(full_message, sizeof(full_message), "%s\n\nHRESULT: 0x%08X", message, res);
+        SPDLOG_CRITICAL("{} (HRESULT 0x{:08X})", message, (uint32_t)res);
         MessageBoxA(h_wnd, full_message, "Error", MB_OK | MB_ICONERROR);
         throw Ship::HResultException(res, message);
     }

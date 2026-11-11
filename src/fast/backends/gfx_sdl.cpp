@@ -36,10 +36,11 @@
 
 #include "ship/window/gui/Gui.h"
 #include "fast/Fast3dGui.h"
+#include "fast/backends/gfx_vulkan.h"
 
 #ifdef _WIN32
-#include <WTypesbase.h>
-#include <Windows.h>
+#include <wtypesbase.h> // PORT: lowercase (mingw cross builds)
+#include <windows.h>
 #endif
 
 #define GFX_BACKEND_NAME "SDL"
@@ -307,6 +308,9 @@ void GfxWindowBackendSDL::Close() {
 }
 
 #ifdef _WIN32
+#ifndef WM_GETDPISCALEDSIZE // PORT: Windows 10 message, not declared for older _WIN32_WINNT targets (mingw)
+#define WM_GETDPISCALEDSIZE 0x02E4
+#endif
 static LRESULT CALLBACK gfx_sdl_wnd_proc(HWND h_wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     switch (message) {
         case WM_GETDPISCALEDSIZE:
@@ -341,17 +345,23 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
 
     SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
 
-#if defined(__APPLE__)
-    bool use_opengl = strcmp(gfxApiName, "OpenGL") == 0;
+    // PORT: Vulkan backend (gfx_vulkan.cpp): a window with a Vulkan surface, no GL context or SDL renderer
+#ifdef ENABLE_VULKAN
+    const bool use_vulkan = strcmp(gfxApiName, "Vulkan") == 0;
 #else
-    constexpr bool use_opengl = true;
+    constexpr bool use_vulkan = false;
+#endif
+#if defined(__APPLE__)
+    bool use_opengl = !use_vulkan && strcmp(gfxApiName, "OpenGL") == 0;
+#else
+    const bool use_opengl = !use_vulkan;
 #endif
 
     if (use_opengl) {
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
         SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    } else {
+    } else if (!use_vulkan) {
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
     }
 
@@ -360,6 +370,12 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#endif
+#if defined(__EMSCRIPTEN__)
+    // PORT: the web build renders with WebGL 2 (OpenGL ES 3.0)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 #endif
 
 #ifdef _WIN32
@@ -384,13 +400,24 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
     int len = snprintf(title, sizeof(title), "%s (%s)", gameName, gfxApiName);
 
 #ifdef __IOS__
-    Uint32 flags = SDL_WINDOW_BORDERLESS;
+    SDL_WindowFlags flags = SDL_WINDOW_BORDERLESS;
+#elif defined(__EMSCRIPTEN__)
+    // PORT: the web build's canvas (#canvas) fills the browser window and follows its size, with a back buffer of
+    // devicePixelRatio pixels per point (sizes in points below, as on macOS)
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_FILL_DOCUMENT;
 #else
-    Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #endif
 
     if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
+    } else if (use_vulkan) {
+#ifdef ENABLE_VULKAN
+        if (!Vulkan_LoadLibrary()) {
+            SPDLOG_ERROR("Could not load the Vulkan library: {}", SDL_GetError());
+        }
+#endif
+        flags = flags | SDL_WINDOW_VULKAN;
     } else {
         flags = flags | SDL_WINDOW_METAL;
     }
@@ -425,7 +452,11 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
     }
 
     if (use_opengl) {
+#if defined(__EMSCRIPTEN__)
+        SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight); // PORT: in points, as on macOS
+#else
         SDL_GetWindowSizeInPixels(mWnd, &mWindowWidth, &mWindowHeight);
+#endif
 
         if (startFullScreen) {
             SetFullscreenImpl(true, false);
@@ -437,6 +468,12 @@ void GfxWindowBackendSDL::Init(const char* gameName, const char* gfxApiName, boo
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
 
         window_impl.Opengl = { mWnd, mCtx };
+    } else if (use_vulkan) {
+        if (startFullScreen) {
+            SetFullscreenImpl(true, false);
+        }
+        SDL_GetWindowSizeInPixels(mWnd, &mWindowWidth, &mWindowHeight);
+        window_impl.Vulkan = { mWnd };
     } else {
         mRenderer = SDL_CreateRenderer(mWnd, nullptr);
         if (mRenderer == nullptr) {
@@ -551,7 +588,7 @@ void GfxWindowBackendSDL::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn), 
 }
 
 void GfxWindowBackendSDL::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__) // PORT: (web build: HiDPI canvas)
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #else
     SDL_GetWindowSizeInPixels(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
@@ -657,7 +694,7 @@ void GfxWindowBackendSDL::HandleSingleEvent(SDL_Event& event) {
             break;
 #endif
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__) // PORT: (web build: HiDPI canvas)
             SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
 #else
             SDL_GetWindowSizeInPixels(mWnd, &mWindowWidth, &mWindowHeight);
@@ -711,6 +748,10 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 }
 
 void GfxWindowBackendSDL::SyncFramerateWithTime() const {
+#if defined(__EMSCRIPTEN__)
+    // PORT: the browser paces the frames (one per requestAnimationFrame); sleeping would block its main thread
+    return;
+#endif
     uint64_t t = qpc_to_100ns(SDL_GetPerformanceCounter());
 
     const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;

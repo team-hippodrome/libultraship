@@ -3,6 +3,7 @@
 
 #include <memory>
 #include "gfx_rendering_api.h"
+#include "gfx_shader_cache.h"
 #include "../interpreter.h"
 
 namespace Ship {
@@ -119,7 +120,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    bool ClearFramebufferColor(float r, float g, float b, float a) override;
     void ClearDepthRegion(int x, int y, int w, int h) override;
+    void InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
@@ -136,6 +139,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+    GLuint CompileProgram(const std::string& vertex, const std::string& fragment, bool dualSource);
+    GLuint LoadProgramBinary(uint64_t key);
+    void StoreProgramBinary(uint64_t key, GLuint program);
+    ShaderDiskCache mShaderCache;
+    std::string mDriverIdentity;
+    bool mProgramBinaries = false;
 
     std::shared_ptr<Ship::ConsoleVariable> mConsoleVariable;
     std::shared_ptr<Ship::ResourceManager> mResourceManager;

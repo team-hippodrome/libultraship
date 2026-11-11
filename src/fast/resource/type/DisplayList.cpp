@@ -1,3 +1,4 @@
+#include <cstdlib> // PORT: strtol, free (not pulled in by other headers with libc++)
 #include "fast/resource/type/DisplayList.h"
 #include <memory>
 

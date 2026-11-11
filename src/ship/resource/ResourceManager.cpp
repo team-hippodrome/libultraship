@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include "ship/resource/File.h"
 #include "ship/resource/archive/Archive.h"
+#include "ship/resource/archive/O2rArchive.h"
 #include <algorithm>
 #include <thread>
 #include <stdexcept>
@@ -32,6 +33,13 @@ void ResourceManager::OnInit(const nlohmann::json& initArgs) {
         std::make_shared<ResourceLoader>(std::dynamic_pointer_cast<ResourceManager>(GetSharedComponent()));
     mArchiveManager =
         std::make_shared<ArchiveManager>(std::dynamic_pointer_cast<ResourceManager>(GetSharedComponent()), mKeystore);
+    if (mBuiltInArchiveData != nullptr) { // PORT: first, so archives on disk come after it
+        auto builtIn = std::make_shared<O2rArchive>(mBuiltInArchiveName, mBuiltInArchiveData, mBuiltInArchiveSize,
+                                                    std::dynamic_pointer_cast<ResourceManager>(GetSharedComponent()),
+                                                    mKeystore);
+        builtIn->Load();
+        mArchiveManager->AddArchive(builtIn);
+    }
     GetArchiveManager()->Init(archivePaths, validHashes);
 
     if (!mArchiveManager->IsInitialized()) {
@@ -42,6 +50,12 @@ void ResourceManager::OnInit(const nlohmann::json& initArgs) {
         }
         throw std::runtime_error("Failed to initialize ArchiveManager");
     }
+}
+
+void ResourceManager::SetBuiltInArchive(const std::string& name, const void* data, size_t size) {
+    mBuiltInArchiveName = name;
+    mBuiltInArchiveData = data;
+    mBuiltInArchiveSize = size;
 }
 
 ResourceManager::~ResourceManager() {

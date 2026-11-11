@@ -8,6 +8,13 @@
 #ifdef __APPLE__
 
 #include <memory>
+#include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -38,6 +45,7 @@ class Device;
 class Function;
 class Buffer;
 class RenderPipelineState;
+class RenderPipelineDescriptor;
 class ComputePipelineState;
 class CommandQueue;
 class Viewport;
@@ -81,7 +89,10 @@ struct ShaderProgramMetal {
     bool markedForDeletion = false;
 
     // hashed by msaa_level
-    MTL::RenderPipelineState* pipeline_state_variants[9];
+    MTL::RenderPipelineState* pipeline_state_variants[9] = {};
+    // PORT: kept to build the other msaa levels' pipelines when first drawn with them (building all of them up front
+    // made every new shader cost several pipeline compiles: visible hitches)
+    MTL::RenderPipelineDescriptor* pipeline_descriptor = nullptr;
 };
 
 /**
@@ -155,7 +166,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     /** @brief Constructs the Metal renderer with optional shared dependencies. */
     GfxRenderingAPIMetal(std::shared_ptr<Ship::ConsoleVariable> consoleVariable = nullptr,
                          std::shared_ptr<Ship::ResourceManager> resourceManager = nullptr);
-    ~GfxRenderingAPIMetal() override = default;
+    ~GfxRenderingAPIMetal() override;
 
     /** @name GfxRenderingAPI implementation */
     /** @{ */
@@ -166,7 +177,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void LoadShader(ShaderProgram* newPrg) override;
     ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) override;
     ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) override;
+    // PORT: the program's pipeline for an msaa level, built on first use
+    MTL::RenderPipelineState* PipelineFor(ShaderProgramMetal* prg, int msaaLevel);
     void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) override;
+    bool PrebuildShadersAsync(const std::vector<std::pair<uint64_t, uint64_t>>& ids) override;
+    float ShaderPrebuildProgress() override;
     void ClearShaderCache() override;
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
@@ -189,10 +204,14 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                      bool can_extract_depth) override;
     void StartDrawToFramebuffer(int fbId, float noiseScale) override;
+    void CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) override;
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    bool ClearFramebufferColor(float r, float g, float b, float a) override;
+    void InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
+    void SetFramebufferReadback(int fbId) override;
     void ResolveMSAAColorBuffer(int fbIdTarge, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
@@ -213,8 +232,13 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void RenderDrawData(ImDrawData* drawData);
     /** @brief Initializes Metal/SDL bridge objects for this renderer instance. */
     bool MetalInit(SDL_Renderer* renderer);
+    // PORT: imgui_impl_metal samples linearly in its shader: a copy of its pipeline that samples nearest, set by an
+    // ImGui draw callback before the game picture (gfx_rendering_api.h)
+    void UseNearestSamplingForImGui() override;
 
   private:
+    MTL::RenderPipelineState* mImGuiNearestPipeline = nullptr;
+    uint64_t mImGuiNearestKey = 0; // the pixel formats and sample count it was made for
     bool NonUniformThreadGroupSupported();
     void SetupScreenFramebuffer(uint32_t width, uint32_t height);
     // Elements that only need to be setup once
@@ -228,6 +252,34 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
     std::unordered_map<std::pair<uint64_t, uint32_t>, struct ShaderProgramMetal, hash_pair_shader_ids>
         mShaderProgramPool;
+
+    // PORT: shader warm-up (PrebuildShadersAsync). Worker threads build the queued programs' library and pipeline
+    // (Metal device calls are thread-safe); CreateAndLoadNewShader takes a finished one instead of building it, or
+    // waits for one being built. Only the render thread touches mShaderProgramPool.
+    struct BuiltShader {
+        MTL::RenderPipelineDescriptor* descriptor = nullptr; // retained
+        MTL::RenderPipelineState* pipeline = nullptr;        // for msaaLevel
+        uint32_t msaaLevel = 1;
+        size_t numFloats = 0;
+        bool threePoint = false;
+        bool srgb = false;
+    };
+    BuiltShader BuildShader(uint64_t shaderId0, uint64_t shaderId1, bool threePoint, bool srgb, uint32_t msaaLevel);
+    void PrebuildWorker();
+    std::mutex mPrebuildMutex;
+    std::condition_variable mPrebuildCond;
+    std::vector<std::pair<uint64_t, uint64_t>> mPrebuildQueue;
+    size_t mPrebuildNext = 0;
+    bool mPrebuildThreePoint = false, mPrebuildSrgb = false;
+    uint32_t mPrebuildMsaa = 1;
+    std::map<std::pair<uint64_t, uint64_t>, BuiltShader> mPrebuilt;    // finished, not yet drawn
+    std::set<std::pair<uint64_t, uint64_t>> mPrebuilding;              // being built by a worker
+    std::set<std::pair<uint64_t, uint64_t>> mPrebuildSkip;             // built by the render thread itself
+    std::vector<std::thread> mPrebuildThreads;
+    std::atomic<bool> mPrebuildStop{ false };
+    int mPrebuildRunning = 0;
+    size_t mPrebuildBuilt = 0;
+    std::chrono::steady_clock::time_point mPrebuildStart;
 
     std::vector<struct TextureDataMetal> mTextures;
     std::vector<FramebufferMetal> mFramebuffers;

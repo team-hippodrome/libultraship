@@ -35,6 +35,55 @@ target_sources(ImGui
 
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 
+# ========= Vulkan =============
+# PORT: Vulkan rendering backend (gfx_vulkan.cpp). Nothing links against a Vulkan loader: volk resolves the entry points
+# at run time from the library SDL loads (vulkan-1.dll, libvulkan.so.1, MoltenVK), so a machine without a Vulkan driver
+# still starts on the other backends. Shaders are compiled to SPIR-V at run time with glslang.
+if(APPLE OR ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(_lus_vulkan_default OFF) # macOS has Metal; MoltenVK builds are opt-in (development)
+else()
+    set(_lus_vulkan_default ON)
+endif()
+option(LUS_ENABLE_VULKAN "Build the Vulkan rendering backend" ${_lus_vulkan_default})
+
+if(LUS_ENABLE_VULKAN)
+    # The static glslang of some distributions (Ubuntu) names SPIRV-Tools-opt/SPIRV-Tools as link dependencies without
+    # finding them itself: found first, they resolve to the imported targets (with their own dependencies)
+    find_package(SPIRV-Tools-opt CONFIG QUIET)
+    find_package(glslang CONFIG QUIET)
+    if(NOT glslang_FOUND)
+        message(WARNING "glslang not found: the Vulkan rendering backend is not built")
+        set(LUS_ENABLE_VULKAN OFF) # this configure only (installing glslang brings it back)
+    endif()
+endif()
+
+if(LUS_ENABLE_VULKAN)
+
+    FetchContent_Declare(
+        VulkanHeaders
+        GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+        GIT_TAG v1.4.304
+    )
+    FetchContent_MakeAvailable(VulkanHeaders)
+
+    FetchContent_Declare(
+        volk
+        GIT_REPOSITORY https://github.com/zeux/volk.git
+        GIT_TAG 1.4.304
+        SOURCE_SUBDIR do-not-build # only volk.c/volk.h are used (target below)
+    )
+    FetchContent_MakeAvailable(volk)
+
+    add_library(lus_volk STATIC ${volk_SOURCE_DIR}/volk.c)
+    target_include_directories(lus_volk PUBLIC ${volk_SOURCE_DIR})
+    target_link_libraries(lus_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(lus_volk PUBLIC VK_NO_PROTOTYPES)
+
+    target_sources(ImGui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+    target_compile_definitions(ImGui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
+    target_link_libraries(ImGui PUBLIC lus_volk)
+endif()
+
 # ========= StormLib =============
 if(INCLUDE_MPQ_SUPPORT)
     set(stormlib_patch_file ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/stormlib-optimizations.patch)
@@ -52,7 +101,11 @@ endif()
 
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
-file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+# Reuse a verified cached header and stop configuration if a download fails.
+file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h"
+     "${STB_DIR}/stb_image.h"
+     EXPECTED_HASH SHA256=c54b15a689e6a1f32c75e2ec23afa442e3e0e37e894b73c1974d08679b20dd5c
+     TLS_VERIFY ON)
 file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
 
 add_library(stb STATIC)

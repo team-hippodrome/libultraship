@@ -32,7 +32,10 @@
 #include <stdint.h>
 #include "types.h"
 #include "gbi.h"
+// PORT PATCH: the Stadium port supplies the original SDK audio ABI (different A_* numbering).
+#ifndef PORT_NO_LUS_ABI
 #include "abi.h"
+#endif
 
 #define NUM_SEGMENTS (16)
 #define SEGMENT_OFFSET(a) ((u32)(a)&0x00FFFFFF)

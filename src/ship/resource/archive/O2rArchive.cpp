@@ -11,6 +11,28 @@ O2rArchive::O2rArchive(const std::string& archivePath, std::shared_ptr<ResourceM
     mZipArchive = nullptr;
 }
 
+O2rArchive::O2rArchive(const std::string& name, const void* data, size_t size,
+                       std::shared_ptr<ResourceManager> resourceManager, std::shared_ptr<Keystore> keystore)
+    : Archive(name, std::move(resourceManager), std::move(keystore)), mMemoryData(data), mMemorySize(size) {
+    mZipArchive = nullptr;
+}
+
+// PORT: every handle of a memory archive reads the same image (a zip source that does not own the data)
+zip_t* O2rArchive::OpenZip(int flags) {
+    if (mMemoryData == nullptr) {
+        return zip_open(GetPath().c_str(), flags, nullptr);
+    }
+    zip_error_t error;
+    zip_error_init(&error);
+    zip_source_t* source = zip_source_buffer_create(mMemoryData, mMemorySize, 0, &error);
+    zip_t* zip = source != nullptr ? zip_open_from_source(source, ZIP_RDONLY, &error) : nullptr;
+    if (zip == nullptr && source != nullptr) {
+        zip_source_free(source);
+    }
+    zip_error_fini(&error);
+    return zip;
+}
+
 O2rArchive::~O2rArchive() {
     SPDLOG_TRACE("destruct o2rarchive: {}", GetPath());
     Close();
@@ -23,7 +45,7 @@ zip_t* O2rArchive::GetZipHandle() {
         mZipArchivePool.pop_back();
         return handle;
     }
-    return zip_open(GetPath().c_str(), ZIP_RDONLY, nullptr);
+    return OpenZip(ZIP_RDONLY);
 }
 
 void O2rArchive::ReleaseZipHandle(zip_t* handle) {
@@ -95,7 +117,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 }
 
 bool O2rArchive::Open() {
-    mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
+    mZipArchive = OpenZip(ZIP_CREATE);
     if (mZipArchive == nullptr) {
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;

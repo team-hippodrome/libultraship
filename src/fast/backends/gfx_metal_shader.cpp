@@ -29,9 +29,8 @@ void gfx_metal_shader_set_resource_manager(std::shared_ptr<Ship::ResourceManager
 }
 // MARK: - String Helpers
 
-#define RAND_NOISE                                                                                                  \
-    "((random(float3(floor(in.position.xy * frameUniforms.noiseScale), float(frameUniforms.frameCount))) + 1.0) / " \
-    "2.0)"
+// random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
+#define RAND_NOISE "random(float3(floor(in.position.xy * frameUniforms.noiseScale), float(frameUniforms.frameCount)))"
 
 static const char* p_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                         bool first_cycle, bool hint_single_element) {

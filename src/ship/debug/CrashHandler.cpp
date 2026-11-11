@@ -6,7 +6,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <DbgHelp.h>
+#include <dbghelp.h> // PORT: lowercase (mingw cross builds on case-sensitive file systems)
 #include <errhandlingapi.h>
 #include <inttypes.h>
 #include <excpt.h>
