@@ -293,6 +293,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     void EnsureUploadCmd();
     void GrowStaging(FrameSlot& slot, size_t needed);
     void CreateSwapchain(uint32_t width, uint32_t height);
+    bool SurfaceHasNoArea() const; // PORT: minimised (see NewFrame)
     void DestroySwapchainViews();
     void RebuildScreenFramebuffer();
     void EnsurePassActive(int fbId);

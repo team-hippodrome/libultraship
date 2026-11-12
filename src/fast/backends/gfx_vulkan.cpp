@@ -1348,6 +1348,16 @@ void GfxRenderingAPIVK::CollectGarbage(FrameSlot& slot) {
     slot.garbageModules.clear();
 }
 
+// PORT: true while the surface has no area (a minimised window on Windows reports currentExtent 0x0). Vulkan forbids
+// a swapchain of that size (vkCreateSwapchainKHR fails or crashes in the driver), so no frame is made until it is back.
+bool GfxRenderingAPIVK::SurfaceHasNoArea() const {
+    VkSurfaceCapabilitiesKHR caps = {};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(mPhysicalDevice, mSurface, &caps) != VK_SUCCESS) {
+        return false;
+    }
+    return caps.currentExtent.width != UINT32_MAX && (caps.currentExtent.width == 0 || caps.currentExtent.height == 0);
+}
+
 void GfxRenderingAPIVK::NewFrame() {
     ImGui_ImplVulkan_NewFrame();
     if (mDevice == VK_NULL_HANDLE) {
@@ -1383,10 +1393,17 @@ void GfxRenderingAPIVK::NewFrame() {
     }
     int dw = 0, dh = 0;
     SDL_GetWindowSizeInPixels(mWindow, &dw, &dh);
-    if (dw <= 0 || dh <= 0) {
+    if (dw <= 0 || dh <= 0 || (SDL_GetWindowFlags(mWindow) & SDL_WINDOW_MINIMIZED) != 0) {
+        mSwapchainNeedsRecreate = true; // the swapchain is out of date when the window comes back
         return; // minimised: no frame (mFrameActive stays false, nothing is recorded or presented)
     }
     if (mSwapchainNeedsRecreate || (uint32_t)dw != mSwapchainExtent.width || (uint32_t)dh != mSwapchainExtent.height) {
+        // PORT: a minimised window can still report a pixel size (SDL keeps the last one) while the surface has no area
+        // (currentExtent 0x0 on Windows): a zero-sized swapchain is invalid, so skip the frame instead
+        if (SurfaceHasNoArea()) {
+            mSwapchainNeedsRecreate = true;
+            return;
+        }
         CreateSwapchain((uint32_t)dw, (uint32_t)dh);
     }
 
@@ -1395,6 +1412,10 @@ void GfxRenderingAPIVK::NewFrame() {
                                              &mSwapchainImageIndex);
     sStat.acquireMs += MsSince(acquireStart);
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (SurfaceHasNoArea()) {
+            mSwapchainNeedsRecreate = true; // minimised meanwhile: no frame
+            return;
+        }
         CreateSwapchain((uint32_t)dw, (uint32_t)dh);
         acquire = vkAcquireNextImageKHR(mDevice, mSwapchain, UINT64_MAX, slot.imageAvailable, VK_NULL_HANDLE,
                                         &mSwapchainImageIndex);
