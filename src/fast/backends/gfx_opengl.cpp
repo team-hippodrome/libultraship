@@ -946,6 +946,15 @@ void GfxRenderingAPIOGL::EndFrame() {
 void GfxRenderingAPIOGL::FinishRender() {
 }
 
+// PORT: SelectTexture skips glBindTexture when mLastBoundTextures says the texture is already bound. Code that binds a
+// texture of its own (a framebuffer's colour texture) must leave the active unit as that cache says, or later draws
+// sample whatever it left bound: the Cup screens' defeated-trainer crosses, drawn into one portrait after another in
+// one frame, came out only on the first portrait (each new render target left texture 0 bound, the cross texture was
+// a cache hit and was never bound again).
+static void RebindCachedTexture(const GLuint* lastBound, int8_t activeUnit) {
+    glBindTexture(GL_TEXTURE_2D, lastBound[activeUnit < 0 ? 0 : activeUnit]);
+}
+
 int GfxRenderingAPIOGL::CreateFramebuffer() {
     GLuint clrbuf;
     glGenTextures(1, &clrbuf);
@@ -953,7 +962,7 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    RebindCachedTexture(mLastBoundTextures, mLastActiveTexture); // was glBindTexture(GL_TEXTURE_2D, 0)
 
     GLuint clrbufMsaa;
     glGenRenderbuffers(1, &clrbufMsaa);
@@ -1029,7 +1038,7 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
                 // PORT: RGBA (was RGB8): the alpha channel holds the N64 colour image's coverage bit
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                glBindTexture(GL_TEXTURE_2D, 0);
+                RebindCachedTexture(mLastBoundTextures, mLastActiveTexture); // was glBindTexture(GL_TEXTURE_2D, 0)
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
                 if (render_target && keepFbo == 0) {
                     sFreshColorFbs.insert(fb_id);
