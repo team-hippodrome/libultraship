@@ -20,6 +20,13 @@
 #include "libultraship/window/gui/GfxDebuggerWindow.h"
 
 #include <fstream>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace Fast {
 
@@ -250,6 +257,75 @@ bool Fast3dWindow::IsFrameReady() {
     return !sAllowDrop || mWindowManagerApi->IsFrameReady();
 }
 
+// PORT: PORT_TRACE_FRAMETIME=1 prints, every 2 s, what a drawn picture costs: the wait for a drawable (StartDraw:
+// the display's swapchain), the interpreter (Run), the GUI and the game picture into the window (EndDraw), submit
+// (EndFrame), and the GPU's busy time (command buffers' GPUStartTime..GPUEndTime, Metal only) per picture.
+std::atomic<uint64_t> gPortGpuBusyNs{ 0 };
+std::atomic<uint64_t> gPortGpuBuffers{ 0 };
+
+// GPU time per command buffer label (PORT_TRACE_FRAMETIME=2: printed with the statistics)
+static std::mutex sGpuLabelLock;
+static std::map<std::string, double> sGpuByLabel;
+void PortGpuByLabel(const char* label, double seconds) {
+    std::lock_guard<std::mutex> g(sGpuLabelLock);
+    sGpuByLabel[label] += seconds;
+}
+
+static bool TraceFrameTime() {
+    static const bool on = getenv("PORT_TRACE_FRAMETIME") != nullptr;
+    return on;
+}
+
+namespace {
+struct FrameTimeStats {
+    std::vector<float> seg[5]; // wait, run, gui, submit, cpu (run + gui + submit)
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    uint64_t gpuNs0 = 0, gpuBuf0 = 0;
+
+    void Add(double wait, double run, double gui, double submit) {
+        seg[0].push_back((float)wait);
+        seg[1].push_back((float)run);
+        seg[2].push_back((float)gui);
+        seg[3].push_back((float)submit);
+        seg[4].push_back((float)(run + gui + submit));
+        auto now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(now - since).count();
+        if (dt < 2.0) {
+            return;
+        }
+        size_t n = seg[0].size();
+        uint64_t gpuNs = gPortGpuBusyNs.load(), gpuBuf = gPortGpuBuffers.load();
+        double gpuMs = (gpuNs - gpuNs0) / 1e6;
+        char line[512];
+        int len = snprintf(line, sizeof line, "[frametime] %5.1f pictures/s", n / dt);
+        static const char* names[5] = { "wait", "run", "gui", "submit", "cpu" };
+        for (int k = 0; k < 5; k++) {
+            std::vector<float> v = seg[k];
+            std::sort(v.begin(), v.end());
+            double sum = 0;
+            for (float x : v) sum += x;
+            len += snprintf(line + len, sizeof line - len, "  %s %.2f/%.2f", names[k], sum / n,
+                            v[std::min(n - 1, (size_t)(0.95 * (n - 1) + 0.5))]);
+        }
+        len += snprintf(line + len, sizeof line - len, "  gpu %.2f ms/picture (%.0f%% busy, %.1f cmdbufs)",
+                        gpuMs / n, 100.0 * gpuMs / (dt * 1000), (double)(gpuBuf - gpuBuf0) / n);
+        fprintf(stderr, "%s   (avg/p95 ms)\n", line);
+        static const bool sByLabel = strcmp(getenv("PORT_TRACE_FRAMETIME"), "2") == 0;
+        if (sByLabel) {
+            std::lock_guard<std::mutex> g(sGpuLabelLock);
+            for (auto& [name, sec] : sGpuByLabel) {
+                fprintf(stderr, "[frametime]    gpu %-36s %.2f ms/picture\n", name.c_str(), sec * 1000 / n);
+            }
+            sGpuByLabel.clear();
+        }
+        for (auto& v : seg) v.clear();
+        since = now;
+        gpuNs0 = gpuNs;
+        gpuBuf0 = gpuBuf;
+    }
+};
+} // namespace
+
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     // Skip dropped frames
     if (!IsFrameReady()) {
@@ -259,19 +335,32 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
         }
     }
 
+    using Clock = std::chrono::steady_clock;
+    const bool trace = TraceFrameTime();
+    const auto t0 = trace ? Clock::now() : Clock::time_point{};
     auto gui = GetGui();
     // Setup mouse state manager
     GetMouseStateManager()->StartFrame();
     // Setup of the backend frames and draw initial Window and GUI menus
     gui->StartDraw();
+    const auto t1 = trace ? Clock::now() : Clock::time_point{};
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
+    const auto t2 = trace ? Clock::now() : Clock::time_point{};
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
+    const auto t3 = trace ? Clock::now() : Clock::time_point{};
     // Finalize swap buffers
     mInterpreter->EndFrame();
+    if (trace) {
+        static FrameTimeStats sStats;
+        auto ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        sStats.Add(ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, Clock::now()));
+    }
 
     return true;
 }

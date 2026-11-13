@@ -8,6 +8,7 @@
 #ifdef __APPLE__
 
 #include <chrono>
+#include <atomic>
 #include "fast/backends/gfx_metal.h"
 
 #include <unordered_set>
@@ -46,6 +47,25 @@
 // MARK: - Helpers
 namespace Fast {
 extern bool gPortReplayFrame; // interpreter.cpp (frame interpolation)
+extern std::atomic<uint64_t> gPortGpuBusyNs, gPortGpuBuffers; // Fast3dWindow.cpp (PORT_TRACE_FRAMETIME)
+void PortGpuByLabel(const char* label, double seconds);       // Fast3dWindow.cpp
+
+// PORT_TRACE_FRAMETIME: adds the command buffer's GPU time (GPUStartTime..GPUEndTime) to the frame-time statistics
+static void TrackGpuTime(MTL::CommandBuffer* cb) {
+    static const bool on = getenv("PORT_TRACE_FRAMETIME") != nullptr;
+    if (!on || cb == nullptr) {
+        return;
+    }
+    cb->addCompletedHandler([](MTL::CommandBuffer* done) {
+        double s = done->GPUEndTime() - done->GPUStartTime();
+        if (s > 0 && s < 1.0) {
+            gPortGpuBusyNs.fetch_add((uint64_t)(s * 1e9));
+            NS::String* label = done->label();
+            PortGpuByLabel(label ? label->utf8String() : "?", s);
+        }
+        gPortGpuBuffers.fetch_add(1);
+    });
+}
 
 GfxRenderingAPIMetal::GfxRenderingAPIMetal(std::shared_ptr<Ship::ConsoleVariable> consoleVariable,
                                            std::shared_ptr<Ship::ResourceManager> resourceManager)
@@ -836,6 +856,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         if (!framebuffer.mHasEndedEncoding)
             framebuffer.mCommandEncoder->endEncoding();
 
+        TrackGpuTime(framebuffer.mCommandBuffer);
         framebuffer.mCommandBuffer->commit();
         it++;
     }
@@ -874,6 +895,7 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
+    TrackGpuTime(screen_framebuffer.mCommandBuffer);
     screen_framebuffer.mCommandBuffer->commit();
 
     // Now that commit has been called, retain the command buffer for GPU sync
@@ -1089,6 +1111,7 @@ static bool DrawOldPictureScaled(MTL::Device* device, MTL::CommandQueue* queue, 
     enc->setFragmentTexture(oldTex, 0);
     enc->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4));
     enc->endEncoding();
+    TrackGpuTime(cb);
     cb->commit();
     // resizes are rare: wait, so the old texture can go and no later pass (on either queue) runs before the copy
     cb->waitUntilCompleted();
@@ -1467,6 +1490,7 @@ GfxRenderingAPIMetal::GetPixelDepth(int fb_id, const std::set<std::pair<float, f
 
     compute_encoder->endEncoding();
 
+    TrackGpuTime(command_buffer);
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
 
@@ -1652,6 +1676,7 @@ void GfxRenderingAPIMetal::InitializeFramebuffer(int fbId, uint32_t width, uint3
     blit->copyFromBuffer(staging, 0, rowBytes, rowBytes * height, MTL::Size(width, height, 1),
                          texture, 0, 0, MTL::Origin(0, 0, 0));
     blit->endEncoding();
+    TrackGpuTime(command);
     command->commit();
     command->waitUntilCompleted();
     staging->release();
@@ -1727,6 +1752,7 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         }
         compute_encoder->endEncoding();
 
+        TrackGpuTime(framebuffer.mCommandBuffer);
         framebuffer.mCommandBuffer->commit();
 
         if (framebuffer.mUseReadbackQueue) {
