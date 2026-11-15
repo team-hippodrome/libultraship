@@ -1035,6 +1035,14 @@ static uint32_t GetTileSizeFromCoordinates(float low, float high) {
     return static_cast<uint32_t>(lroundf((high - low + 4.0f) / 4.0f));
 }
 
+// A wrapping axis (mask set, not CLAMP) repeats every 2^mask texels, so its real size is the mask period, not
+// the tile region. Games that scroll a wrapping texture often leave lrs/lrt drifting relative to uls/ult (only
+// uls/ult matters on hardware), so the tile region is meaningless there and must not be used to trim the texture.
+// A mask smaller than the tile region is stale tile state (see the mask trims below), so it does not count.
+static bool IsWrappingAxis(uint32_t mask, uint32_t clampMode, uint32_t tileSize) {
+    return mask != 0 && (clampMode & G_TX_CLAMP) == 0 && (1u << mask) >= tileSize;
+}
+
 // PORT: fully transparent texels take the colour of their opaque neighbours. Rendering above the N64 resolution
 // filters between texels, and the RGB of transparent ones (often a magenta key colour) bled into the edges of
 // alpha-cut UI art (HUD digits came out pink). Alpha is unchanged. Only for filtered sampling: point-sampled texels
@@ -1116,6 +1124,8 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
     uint32_t maskW = mRdp->texture_tile[tile].masks;
     uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    bool wrapS = IsWrappingAxis(maskW, mRdp->texture_tile[tile].cms, tile_w);
+    bool wrapT = IsWrappingAxis(maskH, mRdp->texture_tile[tile].cmt, tile_h);
     if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
         width = 1u << maskW;
     }
@@ -1124,10 +1134,10 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    if ((isHd || (pyramidLike && !wrapS) || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((isHd || (pyramidLike && !wrapT) || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -1199,6 +1209,8 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
     uint32_t maskW = mRdp->texture_tile[tile].masks;
     uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    bool wrapS = IsWrappingAxis(maskW, mRdp->texture_tile[tile].cms, tile_w);
+    bool wrapT = IsWrappingAxis(maskH, mRdp->texture_tile[tile].cmt, tile_h);
     if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
         width = 1u << maskW;
     }
@@ -1207,10 +1219,10 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    if ((isHd || (pyramidLike && !wrapS) || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((isHd || (pyramidLike && !wrapT) || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -1522,6 +1534,8 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
     uint32_t maskW = mRdp->texture_tile[tile].masks;
     uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    bool wrapS = IsWrappingAxis(maskW, mRdp->texture_tile[tile].cms, tile_w);
+    bool wrapT = IsWrappingAxis(maskH, mRdp->texture_tile[tile].cmt, tile_h);
     if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
         width = 1u << maskW;
     }
@@ -1530,10 +1544,10 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    if ((isHd || (pyramidLike && !wrapS) || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((isHd || (pyramidLike && !wrapT) || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -1630,6 +1644,8 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     // Skip a mask smaller than the tile region though - that's stale tile state, not a real load.
     uint32_t maskW = mRdp->texture_tile[tile].masks;
     uint32_t maskH = mRdp->texture_tile[tile].maskt;
+    bool wrapS = IsWrappingAxis(maskW, mRdp->texture_tile[tile].cms, tile_w);
+    bool wrapT = IsWrappingAxis(maskH, mRdp->texture_tile[tile].cmt, tile_h);
     if (maskW != 0 && (1u << maskW) >= tile_w && (1u << maskW) < width) {
         width = 1u << maskW;
     }
@@ -1638,10 +1654,10 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
     // HD replacement textures must still clamp to the rendered tile region
     bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
-    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+    if ((isHd || (pyramidLike && !wrapS) || clampS) && tile_w > 0 && tile_w < width) {
         width = tile_w;
     }
-    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+    if ((isHd || (pyramidLike && !wrapT) || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
 
@@ -2884,6 +2900,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // mask left by an FB blit (the pause background), which would otherwise tile the FB.
             uint32_t maskW = mRdp->texture_tile[tile].masks;
             uint32_t maskH = mRdp->texture_tile[tile].maskt;
+            bool wrapS = IsWrappingAxis(maskW, cms, tex_width2[i]);
+            bool wrapT = IsWrappingAxis(maskH, cmt, tex_height2[i]);
             if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
                 tex_width[i] = 1u << maskW;
             }
@@ -2893,10 +2911,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // HD replacements must clamp to the tile region
             bool isHd = mRdp->loaded_texture[i].raw_tex_metadata.h_byte_scale != 1 ||
                         mRdp->loaded_texture[i].raw_tex_metadata.v_pixel_scale != 1;
-            if ((isHd || pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
+            if ((isHd || (pyrLike && !wrapS) || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
                 tex_width[i] = tex_width2[i];
             }
-            if ((isHd || pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
+            if ((isHd || (pyrLike && !wrapT) || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
                 tex_height[i] = tex_height2[i];
             }
 
