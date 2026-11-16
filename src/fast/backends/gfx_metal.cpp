@@ -51,6 +51,10 @@ extern std::atomic<uint64_t> gPortGpuBusyNs, gPortGpuBuffers; // Fast3dWindow.cp
 void PortGpuByLabel(const char* label, double seconds);       // Fast3dWindow.cpp
 
 // PORT_TRACE_FRAMETIME: adds the command buffer's GPU time (GPUStartTime..GPUEndTime) to the frame-time statistics
+// PORT: EndFrame count, and the EndFrame whose screen blit mScreenReadbackBuffer holds (ReadFramebufferToCPU)
+static uint64_t sEndFrames = 0;
+static uint64_t sScreenBlitFrame = 0;
+
 static void TrackGpuTime(MTL::CommandBuffer* cb) {
     static const bool on = getenv("PORT_TRACE_FRAMETIME") != nullptr;
     if (!on || cb == nullptr) {
@@ -869,7 +873,9 @@ void GfxRenderingAPIMetal::EndFrame() {
     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,
     // no TBDR tile flush/reload).  The CPU reads this buffer next frame in
     // ReadFramebufferToCPU and converts BGRA8 → RGBA5551 on the CPU side.
+    sEndFrames++;
     if (mScreenReadbackRequested && !gPortReplayFrame) {
+        sScreenBlitFrame = sEndFrames;
         MTL::Texture* screenTex = mTextures[screen_framebuffer.mTextureId].texture;
         uint32_t w = mScreenReadbackWidth;
         uint32_t h = mScreenReadbackHeight;
@@ -1693,14 +1699,47 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
     MTL::Texture* texture = mTextures[framebuffer.mTextureId].texture;
 
     if (fb_id == 0) {
-        // Screen Framebuffer: deferred blit (zero encoder overhead)
-        // Return previous frame's data.  Wait on the retained command buffer
-        // to guarantee the GPU blit has finished before reading the shared buffer.
-        if (mScreenReadbackDataReady && mScreenReadbackBuffer && mScreenReadbackCmdBuf) {
-            mScreenReadbackCmdBuf->waitUntilCompleted();
-            mScreenReadbackCmdBuf->release();
-            mScreenReadbackCmdBuf = nullptr;
+        // Screen Framebuffer: deferred blit (zero encoder overhead). The blit requested by the previous call ran in
+        // the EndFrame that followed it; wait on that command buffer before reading the shared buffer.
+        // PORT: that data is the picture just drawn only when the blit ran in the latest EndFrame (the caller reads
+        // every drawn frame). Otherwise (a capture after frames nobody read: PORT_SHOT_AT, PORT_SCREENSHOT_STOP_ONLY)
+        // it is an older picture or none at all (black), so the screen texture is copied now and waited for.
+        bool fresh = mScreenReadbackDataReady && mScreenReadbackBuffer && mScreenReadbackCmdBuf &&
+                     sScreenBlitFrame == sEndFrames;
+        if (!fresh) {
+            if (mScreenReadbackCmdBuf != nullptr) {
+                mScreenReadbackCmdBuf->release();
+                mScreenReadbackCmdBuf = nullptr;
+            }
             mScreenReadbackDataReady = false;
+            MTL::Texture* screenTex = mTextures[mFramebuffers[0].mTextureId].texture;
+            const size_t bytesPerRow = (size_t)width * 4;
+            const size_t bufSize = bytesPerRow * height;
+            if (screenTex != nullptr && width > 0 && height > 0) {
+                if (!mScreenReadbackBuffer || mScreenReadbackBuffer->length() < bufSize) {
+                    if (mScreenReadbackBuffer) {
+                        mScreenReadbackBuffer->release();
+                    }
+                    mScreenReadbackBuffer = mDevice->newBuffer(bufSize, MTL::ResourceStorageModeShared);
+                }
+                MTL::CommandBuffer* cb = mCommandQueue->commandBuffer();
+                MTL::BlitCommandEncoder* blit = cb->blitCommandEncoder();
+                blit->copyFromTexture(screenTex, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
+                                      mScreenReadbackBuffer, 0, bytesPerRow, bufSize);
+                blit->endEncoding();
+                cb->commit();
+                cb->waitUntilCompleted();
+                mScreenReadbackWidth = width;
+                mScreenReadbackHeight = height;
+            }
+        }
+        if (mScreenReadbackBuffer != nullptr && mScreenReadbackWidth == width && mScreenReadbackHeight == height) {
+            if (fresh) {
+                mScreenReadbackCmdBuf->waitUntilCompleted();
+                mScreenReadbackCmdBuf->release();
+                mScreenReadbackCmdBuf = nullptr;
+                mScreenReadbackDataReady = false;
+            }
 
             uint8_t* bgra = (uint8_t*)mScreenReadbackBuffer->contents();
             uint32_t count = mScreenReadbackWidth * mScreenReadbackHeight;
