@@ -314,6 +314,43 @@ extern "C" int Port_ViFrameBufferState(const void* addr);
 static uintptr_t sPendingOffscreenAddr = 0;
 // A loaded image needs preservation only when the game blends into its CPU pixels (G_NOOP 0x51).
 static bool sPreserveNextColorImage = false;
+static uint32_t sColorImageWidth = 0, sColorImageSiz = 0; // the colour image's width in pixels and texel size
+
+// PORT: a texture rectangle that copies the colour image's own pixels onto the same pixels: the source is the colour
+// image's RDRAM at exactly the position each pixel is drawn to, same width and texel size, 1:1, and the colour and alpha
+// come out as the texel (blending a pixel with itself leaves it as it is). The gallery's enlarged photo copies the
+// frame buffer being shown onto itself every frame (as a 320-wide image: the top quarter of the 640-wide picture). On
+// the N64 that leaves every pixel as it was. Here the picture lives on the GPU and that RDRAM holds whatever was there
+// before (zeros and leftovers), so the copy painted black and noise over a quarter of the photo (OpenGL).
+static bool IsFrameBufferSelfCopy(const Fast::RDP* rdp, uint8_t tile, int32_t ulx, int32_t uly, int16_t uls, int16_t ult,
+                                  int16_t dsdx, int16_t dtdy, bool flip) {
+    if (rdp->color_image_address == nullptr || flip || uls != 0 || ult != 0 || dtdy != (1 << 10)) {
+        return false;
+    }
+    const uint32_t cycle = rdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE);
+    if (cycle == G_CYC_COPY) {
+        if (dsdx != (4 << 10)) { // copy mode steps 4 texels per pixel (GfxDpTextureRectangle)
+            return false;
+        }
+    } else if (cycle == G_CYC_1CYCLE) {
+        const uint32_t rgb = (uint32_t)(rdp->combine_mode & 0xFFFF), alpha = (uint32_t)((rdp->combine_mode >> 16) & 0xFFF);
+        const bool rgbIsTexel = (rgb & 0xF) == ((rgb >> 4) & 0xF) && ((rgb >> 13) & 7) == G_CCMUX_TEXEL0;
+        const bool alphaIsTexel = (alpha & 7) == ((alpha >> 3) & 7) && ((alpha >> 9) & 7) == G_ACMUX_TEXEL0;
+        if (dsdx != (1 << 10) || !rgbIsTexel || !alphaIsTexel) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    const auto& tt = rdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_RGBA || tt.siz != sColorImageSiz || tt.siz != G_IM_SIZ_16b ||
+        rdp->texture_to_load.width != sColorImageWidth) {
+        return false;
+    }
+    const uint8_t* src = rdp->loaded_texture[tt.tmem_index].raw_addr;
+    const uint8_t* dst = (const uint8_t*)rdp->color_image_address + ((size_t)(uly >> 2) * sColorImageWidth + (ulx >> 2)) * 2;
+    return src != nullptr && src == dst;
+}
 static bool sPendingOffscreenPreserve = false;
 static uint32_t sPendingOffscreenWidth = 0;
 static bool sInOffscreen = false;
@@ -4034,6 +4071,10 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     if (lrx <= ulx || lry <= uly) {
         return;
     }
+    static const bool sDrawSelfCopies = getenv("PORT_DRAW_FB_SELF_COPIES") != nullptr; // debug: old behaviour
+    if (!mFbActive && !sDrawSelfCopies && IsFrameBufferSelfCopy(mRdp, tile, ulx, uly, uls, ult, dsdx, dtdy, flip)) {
+        return; // leaves every pixel as it is (IsFrameBufferSelfCopy)
+    }
     uint64_t saved_combine_mode = mRdp->combine_mode;
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
         // Per RDP Command Summary Set Tile's shift s and this dsdx should be set to 4 texels
@@ -4411,6 +4452,8 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
     if (PortTexLog() || gPortDrawLog) fprintf(stderr, "[cimg] fmt=%u siz=%u w=%u addr=%p\n", format, size, width, address);
     mRdp->color_image_address = address;
     uint32_t pixelWidth = width + 1; // the field holds width - 1
+    sColorImageWidth = pixelWidth;
+    sColorImageSiz = size;
     bool offscreen = pixelWidth != 320 && pixelWidth != 640 && address != nullptr && !PortNoRtt();
     if (!offscreen && IsUnshownScreenImage(pixelWidth, address)) {
         offscreen = true;
