@@ -1761,59 +1761,115 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         mScreenReadbackWidth = width;
         mScreenReadbackHeight = height;
     } else {
-        // Custom Framebuffer: synchronous readback via readback queue
-        if (framebuffer.mCommandBuffer == nullptr) { // PORT: nothing drawn into it this frame: leave the buffer as is
-            return;
-        }
-        if (framebuffer.mCommandEncoder && !framebuffer.mHasEndedEncoding) {
-            framebuffer.mCommandEncoder->endEncoding();
-        }
-
-        if (!mConvertToRgb5a1PipelineState) {
-            NS::Error* pso_error = nullptr;
-            mConvertToRgb5a1PipelineState = mDevice->newComputePipelineState(mConvertToRgb5a1Function, &pso_error);
-        }
-
-        MTL::Buffer* output_buffer =
-            mDevice->newBuffer(sizeof(uint16_t) * width * height, MTL::ResourceStorageModeShared);
-
-        MTL::ComputeCommandEncoder* compute_encoder = framebuffer.mCommandBuffer->computeCommandEncoder();
-        compute_encoder->setComputePipelineState(mConvertToRgb5a1PipelineState);
-        compute_encoder->setTexture(texture, 0);
-        compute_encoder->setBuffer(output_buffer, 0, 0);
-
-        MTL::Size tg = MTL::Size::Make(8, 8, 1);
-        MTL::Size total = MTL::Size::Make(width, height, 1);
-        if (mNonUniformThreadgroupSupported) {
-            compute_encoder->dispatchThreads(total, tg);
-        } else {
-            compute_encoder->dispatchThreadgroups(MTL::Size::Make((width + 7) / 8, (height + 7) / 8, 1), tg);
-        }
-        compute_encoder->endEncoding();
-
-        TrackGpuTime(framebuffer.mCommandBuffer);
-        framebuffer.mCommandBuffer->commit();
-
-        if (framebuffer.mUseReadbackQueue) {
-            framebuffer.mCommandBuffer->waitUntilCompleted();
-            uint16_t* values = (uint16_t*)output_buffer->contents();
-            memcpy(rgba16_buf, values, sizeof(uint16_t) * width * height);
-        } else {
-            // First frame on main queue — can't block without deadlock.
-            // Return zeros so the caller gets black instead of garbage.
-            memset(rgba16_buf, 0, sizeof(uint16_t) * width * height);
-            framebuffer.mUseReadbackQueue = true;
-        }
-
-        output_buffer->release();
-
-        // Reset state so StartDrawToFramebuffer can create a fresh command buffer.
-        // Example case: the FB can be reused for another sprite in the same frame.
-        framebuffer.mCommandBuffer = nullptr;
-        framebuffer.mCommandEncoder = nullptr;
-        framebuffer.mHasEndedEncoding = false;
-        mDrawnFramebuffers.erase(fb_id);
+        // Custom Framebuffer: readback via the readback queue (BeginReadFramebuffer / FinishReadFramebuffer)
+        FinishReadFramebuffer(BeginReadFramebuffer(fb_id, width, height), rgba16_buf);
     }
+}
+
+namespace {
+// PORT: a readback begun by BeginReadFramebuffer: the pass that converts the target into 'output' was committed
+// with the target's command buffer; FinishReadFramebuffer waits for it. 'zeros': the first pass of a target, on the main
+// queue, cannot be waited for here (see below).
+struct MetalDeferredRead {
+    int fbId = 0;
+    uint32_t width = 0, height = 0;
+    MTL::CommandBuffer* commandBuffer = nullptr; // retained
+    MTL::Buffer* output = nullptr;
+    bool zeros = false;
+    bool screen = false; // framebuffer 0: read by ReadFramebufferToCPU in FinishReadFramebuffer
+};
+} // namespace
+
+void* GfxRenderingAPIMetal::BeginReadFramebuffer(int fb_id, uint32_t width, uint32_t height) {
+    if (fb_id >= (int)mFramebuffers.size()) {
+        return nullptr;
+    }
+    if (fb_id == 0) {
+        auto* read = new MetalDeferredRead();
+        read->fbId = fb_id;
+        read->width = width;
+        read->height = height;
+        read->screen = true;
+        return read;
+    }
+    FramebufferMetal& framebuffer = mFramebuffers[fb_id];
+    MTL::Texture* texture = mTextures[framebuffer.mTextureId].texture;
+    if (framebuffer.mCommandBuffer == nullptr) { // PORT: nothing drawn into it this frame: leave the buffer as is
+        return nullptr;
+    }
+    if (framebuffer.mCommandEncoder && !framebuffer.mHasEndedEncoding) {
+        framebuffer.mCommandEncoder->endEncoding();
+    }
+
+    if (!mConvertToRgb5a1PipelineState) {
+        NS::Error* pso_error = nullptr;
+        mConvertToRgb5a1PipelineState = mDevice->newComputePipelineState(mConvertToRgb5a1Function, &pso_error);
+    }
+
+    MTL::Buffer* output_buffer = mDevice->newBuffer(sizeof(uint16_t) * width * height, MTL::ResourceStorageModeShared);
+
+    MTL::ComputeCommandEncoder* compute_encoder = framebuffer.mCommandBuffer->computeCommandEncoder();
+    compute_encoder->setComputePipelineState(mConvertToRgb5a1PipelineState);
+    compute_encoder->setTexture(texture, 0);
+    compute_encoder->setBuffer(output_buffer, 0, 0);
+
+    MTL::Size tg = MTL::Size::Make(8, 8, 1);
+    MTL::Size total = MTL::Size::Make(width, height, 1);
+    if (mNonUniformThreadgroupSupported) {
+        compute_encoder->dispatchThreads(total, tg);
+    } else {
+        compute_encoder->dispatchThreadgroups(MTL::Size::Make((width + 7) / 8, (height + 7) / 8, 1), tg);
+    }
+    compute_encoder->endEncoding();
+
+    TrackGpuTime(framebuffer.mCommandBuffer);
+    framebuffer.mCommandBuffer->commit();
+
+    auto* read = new MetalDeferredRead();
+    read->fbId = fb_id;
+    read->width = width;
+    read->height = height;
+    read->output = output_buffer;
+    if (framebuffer.mUseReadbackQueue) {
+        read->commandBuffer = framebuffer.mCommandBuffer;
+        read->commandBuffer->retain();
+    } else {
+        // First frame on main queue — can't block without deadlock.
+        // Return zeros so the caller gets black instead of garbage.
+        read->zeros = true;
+        framebuffer.mUseReadbackQueue = true;
+    }
+
+    // Reset state so StartDrawToFramebuffer can create a fresh command buffer.
+    // Example case: the FB can be reused for another sprite in the same frame.
+    framebuffer.mCommandBuffer = nullptr;
+    framebuffer.mCommandEncoder = nullptr;
+    framebuffer.mHasEndedEncoding = false;
+    mDrawnFramebuffers.erase(fb_id);
+    return read;
+}
+
+void GfxRenderingAPIMetal::FinishReadFramebuffer(void* token, uint16_t* rgba16_buf) {
+    if (token == nullptr) {
+        return;
+    }
+    auto* read = static_cast<MetalDeferredRead*>(token);
+    const size_t bytes = sizeof(uint16_t) * read->width * read->height;
+    if (read->screen) {
+        ReadFramebufferToCPU(read->fbId, read->width, read->height, rgba16_buf);
+    } else if (read->zeros) {
+        memset(rgba16_buf, 0, bytes);
+    } else {
+        read->commandBuffer->waitUntilCompleted();
+        memcpy(rgba16_buf, read->output->contents(), bytes);
+    }
+    if (read->commandBuffer != nullptr) {
+        read->commandBuffer->release();
+    }
+    if (read->output != nullptr) {
+        read->output->release();
+    }
+    delete read;
 }
 
 // PORT: a render-to-texture target is read back whenever the game stops drawing into it. Its passes go to the readback

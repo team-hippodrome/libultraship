@@ -211,6 +211,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     bool ClearFramebufferColor(float r, float g, float b, float a) override;
     void InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
+    void* BeginReadFramebuffer(int fbId, uint32_t width, uint32_t height) override;
+    void FinishReadFramebuffer(void* token, uint16_t* rgba16Buf) override;
     void SetFramebufferReadback(int fbId) override;
     void ResolveMSAAColorBuffer(int fbIdTarge, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>

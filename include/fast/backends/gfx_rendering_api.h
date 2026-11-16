@@ -29,6 +29,12 @@ struct hash_pair_ff {
     }
 };
 
+// PORT: the default BeginReadFramebuffer's token (GfxRenderingAPI::FinishReadFramebuffer)
+struct DeferredRead {
+    int fbId;
+    uint32_t width, height;
+};
+
 class GfxRenderingAPI {
   public:
     virtual ~GfxRenderingAPI() = default;
@@ -89,6 +95,21 @@ class GfxRenderingAPI {
     // Initialize a new single-sample target from top-to-bottom RGBA8 pixels before its first draw.
     virtual void InitializeFramebuffer(int fbId, uint32_t width, uint32_t height, const uint8_t* rgba) = 0;
     virtual void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) = 0;
+    // PORT: deferred readback of a render-to-texture target. Begin queues the copy and returns; Finish waits for it and
+    // writes the pixels (leaves rgba16Buf as it is when there was nothing to read). Readbacks begun one after another
+    // then cost one wait for the GPU instead of one each. The caller draws nothing into the target in between.
+    // Default: the read itself happens in Finish (after the frame's other work has been queued).
+    virtual void* BeginReadFramebuffer(int fbId, uint32_t width, uint32_t height) {
+        return new DeferredRead{ fbId, width, height };
+    }
+    virtual void FinishReadFramebuffer(void* token, uint16_t* rgba16Buf) {
+        if (token == nullptr) {
+            return;
+        }
+        auto* read = static_cast<DeferredRead*>(token);
+        ReadFramebufferToCPU(read->fbId, read->width, read->height, rgba16Buf);
+        delete read;
+    }
     // PORT: this framebuffer is read back after each pass (render-to-texture): backends may set it up for that
     virtual void SetFramebufferReadback(int fbId) {
     }
