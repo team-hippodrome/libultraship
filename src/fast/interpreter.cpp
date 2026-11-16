@@ -255,6 +255,68 @@ static void RttStamp(uintptr_t addr, RttInfo* info) {
 static bool RttStampValid(uintptr_t addr, const RttInfo& info) {
     return memcmp((const void*)addr, info.stamp, sizeof(info.stamp)) == 0;
 }
+// PORT: readbacks begun but not yet written to RDRAM (RttReadback). Each readback waited for the GPU on its own, about
+// 0.5 ms however small the target; a scene that draws six or eight pictures (portraits, the VS screen) spent up to 8 ms
+// of one frame waiting. They are now begun when the game stops drawing into a target and finished together: at the end
+// of the frame, before the game's CPU can look at the buffers (the frame's task is not complete before that), or
+// earlier, as soon as the frame itself reads one of these buffers (texture image, TMEM load, render target lookup)
+// or draws into the target again. RttFinishIfPending is that check.
+struct RttPendingRead {
+    uintptr_t addr;
+    uint32_t w, h;
+    uint32_t stamp[4]; // the target's stamp when the readback began: RDRAM must still hold it when it is written
+    void* token;
+};
+static std::vector<RttPendingRead> sRttPending;
+static Fast::GfxRenderingAPI* sRttPendingApi = nullptr;
+
+static void RttFinishReadbacks() {
+    if (sRttPending.empty()) {
+        return;
+    }
+    static std::vector<uint16_t> buf;
+    std::vector<RttPendingRead> pending;
+    pending.swap(sRttPending);
+    for (auto& r : pending) {
+        buf.assign((size_t)r.w * r.h, 0);
+        sRttPendingApi->FinishReadFramebuffer(r.token, buf.data());
+        uint8_t* dst = (uint8_t*)r.addr;
+        if (memcmp(dst, r.stamp, sizeof(r.stamp)) != 0) {
+            continue; // the memory was reused in the meantime: it is not the target's any more
+        }
+        if (PortTexLog()) {
+            size_t nz = 0, opaque = 0;
+            for (uint16_t v : buf) {
+                nz += (v & 0xFFFE) != 0;
+                opaque += v & 1;
+            }
+            fprintf(stderr, "[rtt] readback %p %ux%u: %zu coloured, %zu opaque pixels\n", (void*)r.addr, r.w, r.h, nz,
+                    opaque);
+        }
+        for (size_t i = 0; i < buf.size(); i++) {
+            dst[i * 2] = (uint8_t)(buf[i] >> 8);
+            dst[i * 2 + 1] = (uint8_t)buf[i];
+        }
+        auto it = sOffscreenFbs.find(r.addr);
+        if (it != sOffscreenFbs.end()) {
+            memcpy(it->second.stamp, dst, sizeof(it->second.stamp)); // see RttStamp
+        }
+    }
+}
+
+// Finishes the pending readbacks when [p, p + n) overlaps one of their buffers (about to be read or drawn into).
+static inline void RttFinishIfPending(const void* p, size_t n) {
+    if (sRttPending.empty() || p == nullptr) {
+        return;
+    }
+    const uintptr_t a = (uintptr_t)p;
+    for (const auto& r : sRttPending) {
+        if (a < r.addr + (uintptr_t)r.w * r.h * 2 && r.addr < a + n) {
+            RttFinishReadbacks();
+            return;
+        }
+    }
+}
 static void RttForgetOverlapping(uintptr_t start, uintptr_t end) {
     for (auto it = sOffscreenFbs.begin(); it != sOffscreenFbs.end();) {
         uintptr_t size = (uintptr_t)it->second.w * it->second.h * 2;
@@ -289,6 +351,17 @@ static void RttApplyForgets() {
 static bool RttLookup(const void* addr, RttInfo* out, float* rowOff, float* colOff = nullptr) {
     uintptr_t a = (uintptr_t)addr;
     static const bool off = getenv("PORT_NO_RTT") != nullptr || getenv("PORT_NO_RTT_SAMPLE") != nullptr; // debug: sample RDRAM instead of render targets
+    RttFinishIfPending(addr, 1); // (reads the stamp in RDRAM)
+    if (!sRttPending.empty()) { // forgets about to be applied may drop a target whose readback is pending
+        bool forgets;
+        {
+            std::lock_guard<std::mutex> g(sRttForgetLock);
+            forgets = !sRttForgetPending.empty();
+        }
+        if (forgets) {
+            RttFinishReadbacks();
+        }
+    }
     RttApplyForgets();
     if (off || addr == nullptr || sOffscreenFbs.empty()) return false;
     for (auto it = sOffscreenFbs.begin(); it != sOffscreenFbs.end();) {
@@ -1880,6 +1953,10 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                   ->second.replacementData
             : mRdp->loaded_texture[tmemIdex].addr;
 
+    if (!importReplacement) {
+        RttFinishIfPending(origAddr, std::max<uint32_t>(origSizeBytes, 1));
+    }
+
     // Check if this texture address is a registered GPU framebuffer mirror.
     // If so, bind the GPU FB directly — full resolution, no CPU readback needed.
     if (origAddr != nullptr && !importReplacement) {
@@ -3442,6 +3519,7 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
         mRdp->viewport_or_scissor_changed = true;
         mRenderingState.viewport = {};
         mRenderingState.scissor = {};
+        RttFinishIfPending((const void*)sPendingOffscreenAddr, (size_t)w * h * 2);
         sOffscreenFbs[sPendingOffscreenAddr] = RttInfo{ id, w, h, {} };
         RttStamp(sPendingOffscreenAddr, &sOffscreenFbs[sPendingOffscreenAddr]);
         sCurOffscreenAddr = sPendingOffscreenAddr;
@@ -3469,6 +3547,7 @@ void Interpreter::GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t 
     // fprintf(stderr, "GfxDpSetTextureImage: %s (width=%d; size=0x%X)\n",
     //         rawTexMetdata.resource ? rawTexMetdata.resource->GetInitData()->Identifier.GetPath().c_str() : nullptr,
     //         width, size);
+    RttFinishIfPending(addr, 1);
     mRdp->texture_to_load.addr = (const uint8_t*)addr;
     mRdp->texture_to_load.siz = size;
     mRdp->texture_to_load.width = width;
@@ -3530,6 +3609,7 @@ void Interpreter::GfxDpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uin
 }
 
 void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
+    RttFinishIfPending(mRdp->texture_to_load.addr, 1 << 20); // (reads RDRAM from this address on)
     SUPPORT_CHECK(mRdp->texture_to_load.siz == G_IM_SIZ_16b);
 
     uint16_t tmem = mRdp->texture_tile[tile].tmem;
@@ -3592,6 +3672,7 @@ static void PortDumpTex(const uint8_t* addr, uint32_t lrs, uint32_t siz, uint32_
 }
 
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
+    RttFinishIfPending(mRdp->texture_to_load.addr, 1 << 20); // (reads RDRAM from this address on)
     PortDumpTex(mRdp->texture_to_load.addr, lrs, mRdp->texture_to_load.siz, dxt);
     if (PortTexLog()) { fprintf(stderr, "[tex] loadblock t%u siz=%u lrs=%u dxt=%u data:", tile, mRdp->texture_to_load.siz, lrs, dxt); for (int k = 0; k < 24; k++) fprintf(stderr, "%02x", mRdp->texture_to_load.addr[k]); fputc(10, stderr); }
     SUPPORT_CHECK(uls == 0);
@@ -3689,6 +3770,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 }
 
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
+    RttFinishIfPending(mRdp->texture_to_load.addr, 1 << 20); // (reads RDRAM from this address on)
     if (PortTexLog()) fprintf(stderr, "[tex] loadtile t%u %u %u %u %u\n", tile, uls, ult, lrs, lrt);
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
 
@@ -4370,28 +4452,23 @@ void Interpreter::GfxDpSetZImage(void* zBufAddr) {
 void Interpreter::RttReadback() {
     Flush();
     static const bool off = getenv("PORT_NO_RTT_READBACK") != nullptr;
+    RttFinishIfPending((const void*)sCurOffscreenAddr, 1); // this target's last readback (its stamp is checked below)
     auto it = sOffscreenFbs.find(sCurOffscreenAddr);
     if (off || mReplayPass || sCurOffscreenAddr == 0 || it == sOffscreenFbs.end() || !RttStampValid(it->first, it->second)) {
         return;
     }
-    uint32_t w = it->second.w, h = it->second.h;
-    static std::vector<uint16_t> buf;
-    buf.assign((size_t)w * h, 0);
-    mRapi->ReadFramebufferToCPU(it->second.fb, w, h, buf.data());
-    if (PortTexLog()) {
-        size_t nz = 0, opaque = 0;
-        for (uint16_t v : buf) {
-            nz += (v & 0xFFFE) != 0;
-            opaque += v & 1;
-        }
-        fprintf(stderr, "[rtt] readback fb %d %ux%u: %zu coloured, %zu opaque pixels\n", it->second.fb, w, h, nz, opaque);
+    static const bool sync = getenv("PORT_RTT_READBACK_SYNC") != nullptr; // debug: finish each readback at once
+    RttPendingRead r;
+    r.addr = it->first;
+    r.w = it->second.w;
+    r.h = it->second.h;
+    memcpy(r.stamp, it->second.stamp, sizeof(r.stamp));
+    r.token = mRapi->BeginReadFramebuffer(it->second.fb, r.w, r.h);
+    sRttPendingApi = mRapi;
+    sRttPending.push_back(r);
+    if (sync) {
+        RttFinishReadbacks();
     }
-    uint8_t* dst = (uint8_t*)it->first;
-    for (size_t i = 0; i < buf.size(); i++) {
-        dst[i * 2] = (uint8_t)(buf[i] >> 8);
-        dst[i * 2 + 1] = (uint8_t)buf[i];
-    }
-    memcpy(it->second.stamp, dst, sizeof(it->second.stamp)); // see RttStamp
 }
 
 // PORT: a screen-sized picture the game never shows (osViSwapBuffer) is drawn to be used as a texture (Gallery
@@ -4429,6 +4506,7 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
             if (sInOffscreen) {
                 RttReadback();
             }
+            RttFinishIfPending((const void*)it->first, (size_t)it->second.w * it->second.h * 2); // drawn into again
             SetFrameBuffer(it->second.fb, 1.0f);
             mActiveFrameBuffer = mFrameBuffers.find(it->second.fb);
             mFbActive = true;
@@ -7355,6 +7433,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    RttFinishReadbacks(); // before the frame's task completes and the game can read the buffers
     if (traceTiming) {
         const auto setupMs = std::chrono::duration<double, std::milli>(listStart - runStart).count();
         const auto listMs = std::chrono::duration<double, std::milli>(RenderClock::now() - listStart).count();
