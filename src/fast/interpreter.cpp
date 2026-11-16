@@ -476,6 +476,60 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
+namespace {
+// PORT: hash of texture bytes for the texture cache key (ImportTexture). Runs on every texture import, over up to
+// 1 MB; the byte-at-a-time FNV-1a it replaces (one dependent multiply per byte) was the window thread's largest single
+// cost after the event pump. xxHash64's stripe loop: four independent lanes, 32 bytes per step.
+inline uint64_t HashRotl(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+inline uint64_t HashRead64(const uint8_t* p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+constexpr uint64_t kHashP1 = 0x9E3779B185EBCA87ull, kHashP2 = 0xC2B2AE3D27D4EB4Full, kHashP3 = 0x165667B19E3779F9ull,
+                   kHashP4 = 0x85EBCA77C2B2AE63ull, kHashP5 = 0x27D4EB2F165667C5ull;
+inline uint64_t HashRound(uint64_t acc, uint64_t v) {
+    return HashRotl(acc + v * kHashP2, 31) * kHashP1;
+}
+inline uint64_t HashMerge(uint64_t acc, uint64_t v) {
+    return (acc ^ HashRound(0, v)) * kHashP1 + kHashP4;
+}
+uint64_t HashBytes(const uint8_t* p, size_t n, uint64_t seed) {
+    const uint8_t* end = p + n;
+    uint64_t h;
+    if (n >= 32) {
+        uint64_t v1 = seed + kHashP1 + kHashP2, v2 = seed + kHashP2, v3 = seed, v4 = seed - kHashP1;
+        for (const uint8_t* limit = end - 32; p <= limit; p += 32) {
+            v1 = HashRound(v1, HashRead64(p));
+            v2 = HashRound(v2, HashRead64(p + 8));
+            v3 = HashRound(v3, HashRead64(p + 16));
+            v4 = HashRound(v4, HashRead64(p + 24));
+        }
+        h = HashRotl(v1, 1) + HashRotl(v2, 7) + HashRotl(v3, 12) + HashRotl(v4, 18);
+        h = HashMerge(HashMerge(HashMerge(HashMerge(h, v1), v2), v3), v4);
+    } else {
+        h = seed + kHashP5;
+    }
+    h += n;
+    for (; p + 8 <= end; p += 8) h = HashRotl(h ^ HashRound(0, HashRead64(p)), 27) * kHashP1 + kHashP4;
+    if (p + 4 <= end) {
+        uint32_t v;
+        memcpy(&v, p, 4);
+        h = HashRotl(h ^ (uint64_t)v * kHashP1, 23) * kHashP2 + kHashP3;
+        p += 4;
+    }
+    for (; p < end; p++) h = HashRotl(h ^ *p * kHashP5, 11) * kHashP1;
+    h ^= h >> 33;
+    h *= kHashP2;
+    h ^= h >> 29;
+    h *= kHashP3;
+    h ^= h >> 32;
+    return h;
+}
+} // namespace
+
 extern "C" uint64_t Port_ViTick();
 
 namespace {
@@ -1875,11 +1929,11 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     } else {
         key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
     }
-    {   // PORT: content hash (FNV-1a over the texels and the palette in use)
+    {   // PORT: content hash (HashBytes over the texels and the palette in use)
         uint64_t h = 1469598103934665603ull;
         auto mix = [&h](const uint8_t* p, size_t n) {
             if (p == nullptr) return;
-            for (size_t k = 0; k < n; k++) h = (h ^ p[k]) * 1099511628211ull;
+            h = HashBytes(p, n, h);
         };
         if ((uintptr_t)origAddr >= 0x100000000ull) {
             mix(origAddr, std::min<uint32_t>(origSizeBytes, 1u << 20));
