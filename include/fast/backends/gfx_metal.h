@@ -249,9 +249,9 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     // Elements that only need to be setup once
     SDL_Renderer* mRenderer;
     CA::MetalLayer* mLayer; // CA::MetalLayer*
-    MTL::Device* mDevice;
-    MTL::CommandQueue* mCommandQueue;
-    MTL::CommandQueue* mReadbackQueue;
+    MTL::Device* mDevice = nullptr;
+    MTL::CommandQueue* mCommandQueue = nullptr;
+    MTL::CommandQueue* mReadbackQueue = nullptr;
 
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
@@ -289,7 +289,13 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::vector<struct TextureDataMetal> mTextures;
     // PORT: a scene change uploads ~300 small textures in one frame, nearly all of it MTLDevice newTexture. Textures are
     // suballocated from heaps instead, one descriptor is reused and samplers are shared (see UploadTexture).
+    // Empty heaps are given back (one kept spare) and their number is capped; beyond the cap textures come from the
+    // device (see TrimTextureHeaps, NewHeapTexture).
     std::vector<MTL::Heap*> mTextureHeaps;
+    size_t mHeapHint = 0;             // the heap the last allocation came from, tried first
+    uint32_t mHeapTrimCountdown = 0;  // frames since the last look for empty heaps
+    MTL::Texture* NewHeapTexture();   // from a heap, or nullptr (all full and no more heaps allowed)
+    void TrimTextureHeaps();
     MTL::TextureDescriptor* mUploadDescriptor = nullptr;
     MTL::SamplerState* mSamplerCache[2 * 4 * 4] = {};
     std::vector<FramebufferMetal> mFramebuffers;
