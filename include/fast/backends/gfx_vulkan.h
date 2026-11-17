@@ -29,6 +29,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <stdexcept>
 
@@ -296,6 +297,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     std::vector<uint32_t> WarmPipelineSlots(const std::vector<uint32_t>& recipes) const;
     void RecordPipeline(uint64_t shaderId0, uint64_t shaderId1, uint32_t key);
     void SavePipelineCache();
+    void MaybeSavePipelineCache();
     void DestroyShaderProgram(ShaderProgramVK& prg);
     void EnsureUploadCmd();
     void GrowStaging(FrameSlot& slot, size_t needed);
@@ -379,7 +381,13 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     std::string mPipelineListPath;
     std::string mPipelineCachePath;
     std::atomic<bool> mPipelineCacheDirty{ false }; // set by workers too
-    std::chrono::steady_clock::time_point mPipelineCacheSaved;
+    std::atomic<double> mPipelineCacheSavedMs{ 0.0 };  // steady clock
+    std::shared_mutex mPipelineCacheLock;              // shared: creating a pipeline; exclusive: saving the cache
+    std::atomic<int> mPipelineCacheSaves{ 0 };
+    std::atomic<int> mPipelinesCreated{ 0 };
+    std::atomic<int> mPipelineCacheHits{ 0 }; // creation feedback: found in the pipeline cache
+    size_t mPipelineCacheLoadedBytes = 0;
+    bool mHasCreationFeedback = false;
 
     std::map<uint32_t, VkRenderPass> mRenderPassCache; // key: msaa | (hasDepth << 8)
     std::map<uint32_t, VkSampler> mSamplerCache;       // key: linear | cms<<1 | cmt<<9 | filter mode<<17

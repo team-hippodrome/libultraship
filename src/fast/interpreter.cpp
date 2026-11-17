@@ -733,6 +733,8 @@ void Interpreter::QueueShaderWarmup(std::vector<std::pair<uint64_t, uint64_t>> i
     }
     mWarmupQueue = std::move(ids);
     mWarmupNext = 0;
+    mWarmupStart = std::chrono::steady_clock::now();
+    mWarmupBusyMs = 0.0;
 }
 
 float Interpreter::ShaderWarmupProgress() {
@@ -759,9 +761,14 @@ void Interpreter::WarmupStep() {
         }
     }
     mRenderingState.mShaderProgram = nullptr;
+    mWarmupBusyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     if (mWarmupNext >= mWarmupQueue.size()) {
         if (sTrace) {
-            fprintf(stderr, "[shader] warm-up done: %zu programs\n", mWarmupQueue.size());
+            const std::string cache = mRapi->ShaderCacheStats();
+            fprintf(stderr, "[shader] warm-up done: %zu programs in %.0f ms (%.0f ms building)%s%s\n",
+                    mWarmupQueue.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mWarmupStart).count(),
+                    mWarmupBusyMs, cache.empty() ? "" : "; ", cache.c_str());
         }
         mWarmupQueue = {};
         mWarmupNext = 0;

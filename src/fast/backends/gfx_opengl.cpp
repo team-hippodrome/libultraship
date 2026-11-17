@@ -522,6 +522,11 @@ GLuint GfxRenderingAPIOGL::CompileProgram(const std::string& vs_buf, const std::
     return shader_program;
 }
 
+std::string GfxRenderingAPIOGL::ShaderCacheStats() {
+    return "program binary cache " + std::string(mProgramBinaries ? "on" : "not supported by this driver") + ": " +
+           std::to_string(mProgramBinaryHits) + " loaded, " + std::to_string(mProgramCompiles) + " compiled";
+}
+
 GLuint GfxRenderingAPIOGL::LoadProgramBinary(uint64_t key) {
 #ifndef __EMSCRIPTEN__
     if (!mProgramBinaries) return 0;
@@ -575,6 +580,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     if (shader_program == 0) {
         shader_program = CompileProgram(vs_buf, fs_buf, dualSource);
         StoreProgramBinary(key, shader_program);
+        mProgramCompiles++;
+    } else {
+        mProgramBinaryHits++;
     }
 
     size_t cnt = 0;

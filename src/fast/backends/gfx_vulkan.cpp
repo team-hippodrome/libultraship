@@ -26,6 +26,11 @@
 #include <sstream>
 #include <unordered_set>
 #include <chrono>
+#include <shared_mutex>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -85,12 +90,19 @@ static std::shared_ptr<Ship::ResourceManager> sVKResourceManager;
 
 // debug: PORT_VK_STATS=1 prints where the backend spent its time, every 60 drawn frames
 static const bool sStats = getenv("PORT_VK_STATS") != nullptr;
+// the warm-up summary (duration, cache hits): also with the tracing a tester log is made with
+static const bool sTraceWarmup =
+    sStats || getenv("PORT_TRACE_PACING") != nullptr || getenv("PORT_TRACE_SHADERS") != nullptr;
+static std::atomic<int> sSpirvCacheHits{ 0 }, sSpirvCompiles{ 0 };
 static struct {
     int programs = 0, prebuiltPrograms = 0, pipelines = 0, syncSubmits = 0, commandBuffers = 0, commandBuffersAllocated = 0;
     double programMs = 0, pipelineMs = 0, syncMs = 0, fenceMs = 0, acquireMs = 0;
 } sStat;
 static double MsSince(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+static double NowMs() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 GfxRenderingAPIVK::GfxRenderingAPIVK(std::shared_ptr<Ship::ConsoleVariable> consoleVariable,
@@ -112,6 +124,7 @@ static std::vector<uint32_t> CompileGlslToSpirv(const ShaderDiskCache& cache, co
                                                "vulkan1.1-spv1.3-default-v1"});
     const auto cached = cache.Load(key);
     if (cached.size() >= 5 * sizeof(uint32_t) && cached.size() % sizeof(uint32_t) == 0) {
+        sSpirvCacheHits++;
         std::vector<uint32_t> code(cached.size() / sizeof(uint32_t));
         memcpy(code.data(), cached.data(), cached.size());
         if (code[0] == 0x07230203 && code[3] != 0 && code[4] == 0) return code;
@@ -130,6 +143,7 @@ static std::vector<uint32_t> CompileGlslToSpirv(const ShaderDiskCache& cache, co
     input.resource = glslang_default_resource();
 
     std::vector<uint32_t> spirv;
+    sSpirvCompiles++;
     glslang_shader_t* shader = glslang_shader_create(&input);
     glslang_program_t* program = nullptr;
     const char* stage = vertex ? "vertex" : "fragment";
@@ -965,6 +979,10 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
         if (strcmp(e.extensionName, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) == 0) {
             hasDynamicStateExt = true;
         }
+        if (strcmp(e.extensionName, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME) == 0) {
+            enabledDevExts.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+            mHasCreationFeedback = true;
+        }
     }
     // PORT: depth test, depth write and the compare op as dynamic state (VK_EXT_extended_dynamic_state; core in 1.3):
     // a program then needs one pipeline per (sample count, depth buffer) instead of one per depth/decal combination,
@@ -1056,6 +1074,32 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
             }
             fclose(f);
         }
+        // PORT: the header names the driver that wrote it (VkPipelineCacheHeaderVersionOne). Data from another driver,
+        // device or driver version is dropped here rather than left to the driver (which ignores it, or worse); the
+        // next save replaces the file.
+        const char* cacheState = "none";
+        if (!cacheData.empty()) {
+            VkPipelineCacheHeaderVersionOne header = {};
+            if (cacheData.size() < sizeof(header)) {
+                cacheState = "unreadable (started empty)";
+                cacheData.clear();
+            } else {
+                memcpy(&header, cacheData.data(), sizeof(header));
+                if (header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+                    header.vendorID != mDeviceProps.vendorID || header.deviceID != mDeviceProps.deviceID ||
+                    memcmp(header.pipelineCacheUUID, mDeviceProps.pipelineCacheUUID, VK_UUID_SIZE) != 0) {
+                    cacheState = "from another driver or device (started empty)";
+                    cacheData.clear();
+                } else {
+                    cacheState = "matches this driver";
+                }
+            }
+        }
+        mPipelineCacheLoadedBytes = cacheData.size();
+        if (sTraceWarmup) {
+            fprintf(stderr, "[vkcache] pipeline cache %s: %zu KB %s; SPIR-V cache %s\n", mPipelineCachePath.c_str(),
+                    cacheData.size() / 1024, cacheState, getenv("PORT_NO_SHADER_DISK_CACHE") ? "off" : "on");
+        }
         VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
         pci.initialDataSize = cacheData.size();
         pci.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
@@ -1064,7 +1108,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
             pci.pInitialData = nullptr;
             VK_CHECK(vkCreatePipelineCache(mDevice, &pci, nullptr, &mPipelineCache));
         }
-        mPipelineCacheSaved = std::chrono::steady_clock::now();
+        mPipelineCacheSavedMs = NowMs();
         LoadPipelineList();
     }
 
@@ -1273,7 +1317,17 @@ void GfxRenderingAPIVK::RecordPipeline(uint64_t shaderId0, uint64_t shaderId1, u
     }
 }
 
+// Every few seconds while new pipelines are created, from the render thread or a warm-up worker: the game ends with
+// _exit (window close, SIGTERM, PORT_STOP_AT) and may crash, so there is no saving at shutdown to rely on.
+void GfxRenderingAPIVK::MaybeSavePipelineCache() {
+    if (mPipelineCacheDirty && NowMs() - mPipelineCacheSavedMs > 5000.0) {
+        SavePipelineCache();
+    }
+}
+
 void GfxRenderingAPIVK::SavePipelineCache() {
+    // exclusive: no pipeline is created meanwhile (CreatePipeline holds the lock shared)
+    std::unique_lock<std::shared_mutex> cacheLock(mPipelineCacheLock);
     if (mPipelineCache == VK_NULL_HANDLE || !mPipelineCacheDirty) {
         return;
     }
@@ -1296,7 +1350,8 @@ void GfxRenderingAPIVK::SavePipelineCache() {
         }
     }
     mPipelineCacheDirty = false;
-    mPipelineCacheSaved = std::chrono::steady_clock::now();
+    mPipelineCacheSavedMs = NowMs();
+    mPipelineCacheSaves++;
 }
 
 // PORT: shader warm-up (Interpreter::QueueShaderWarmup): the programs earlier runs drew, built on worker threads with
@@ -1369,6 +1424,11 @@ float GfxRenderingAPIVK::ShaderPrebuildProgress() {
 }
 
 void GfxRenderingAPIVK::PrebuildWorker() {
+#ifdef __APPLE__
+    // MoltenVK compiles through the Metal compiler service at the calling thread's QoS: at the default QoS of a new
+    // thread the requests starved for minutes on a busy machine (the render thread, user-interactive, was served)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
     std::unique_lock<std::mutex> lock(mPrebuildMutex);
     while (!mPrebuildStop && mPrebuildNext < mPrebuildQueue.size()) {
         const size_t index = mPrebuildNext++;
@@ -1390,15 +1450,33 @@ void GfxRenderingAPIVK::PrebuildWorker() {
         mPrebuilt[key] = std::move(built);
         mPrebuildBuilt++;
         mPrebuildBlockingDone += index < mPrebuildBlocking ? 1 : 0;
-        if (sStats && mPrebuildBlockingDone == mPrebuildBlocking && index < mPrebuildBlocking) {
-            fprintf(stderr, "[vkstats] warm-up: start-up part (%zu programs) done in %.0f ms\n", mPrebuildBlocking,
+        if (sTraceWarmup && mPrebuildBlockingDone == mPrebuildBlocking && index < mPrebuildBlocking) {
+            fprintf(stderr, "[vkcache] warm-up: start-up part (%zu programs) done in %.0f ms\n", mPrebuildBlocking,
                     MsSince(mPrebuildStart));
         }
         mPrebuildCond.notify_all();
+        lock.unlock();
+        MaybeSavePipelineCache();
+        lock.lock();
     }
-    if (--mPrebuildRunning == 0 && sStats) {
-        fprintf(stderr, "[vkstats] warm-up done: %zu programs queued, %zu built ahead, in %.0f ms\n",
-                mPrebuildQueue.size(), mPrebuildBuilt, MsSince(mPrebuildStart));
+    if (--mPrebuildRunning == 0) {
+        lock.unlock();
+        SavePipelineCache();
+        if (sTraceWarmup) {
+            const int created = mPipelinesCreated, hits = mPipelineCacheHits;
+            fprintf(stderr,
+                    "[vkcache] warm-up done: %zu programs queued, %zu built ahead, in %.0f ms; SPIR-V cache %d hits, "
+                    "%d compiled; pipelines %d created, %s; pipeline cache saved %d times\n",
+                    mPrebuildQueue.size(), mPrebuildBuilt, MsSince(mPrebuildStart), sSpirvCacheHits.load(),
+                    sSpirvCompiles.load(), created,
+                    mHasCreationFeedback ? (std::to_string(hits) + " from the pipeline cache").c_str()
+                                         : "cache hits not reported by this driver",
+                    mPipelineCacheSaves.load());
+        }
+        SPDLOG_INFO("Vulkan warm-up: {} programs, {} built ahead, {:.0f} ms; pipeline cache hits {}/{}",
+                    mPrebuildQueue.size(), mPrebuildBuilt, MsSince(mPrebuildStart), mPipelineCacheHits.load(),
+                    mPipelinesCreated.load());
+        lock.lock();
     }
 }
 
@@ -2044,8 +2122,27 @@ VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t
     pci.renderPass = GetRenderPass(msaaLevel, hasDepth);
     pci.subpass = 0;
 
+    // PORT: creation feedback (VK_EXT_pipeline_creation_feedback) says whether the pipeline cache had it
+    VkPipelineCreationFeedbackEXT feedback = {};
+    VkPipelineCreationFeedbackCreateInfoEXT feedbackInfo = {
+        VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT
+    };
+    feedbackInfo.pPipelineCreationFeedback = &feedback;
+    if (mHasCreationFeedback) {
+        pci.pNext = &feedbackInfo;
+    }
+
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
+    VkResult res;
+    {
+        std::shared_lock<std::shared_mutex> cacheLock(mPipelineCacheLock);
+        res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
+    }
+    mPipelinesCreated++;
+    if (res == VK_SUCCESS && (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT) != 0 &&
+        (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT) != 0) {
+        mPipelineCacheHits++;
+    }
     if (res != VK_SUCCESS) {
         SPDLOG_ERROR("Vulkan: pipeline creation failed ({}) for render state {:x}", (int)res, key);
         pipeline = VK_NULL_HANDLE;
@@ -2070,8 +2167,8 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
         sStat.pipelines++;
         sStat.pipelineMs += MsSince(statStart);
         prg->built.pipelines[slot] = pipeline;
-        if (sStats) {
-            fprintf(stderr, "[vkstats] pipeline built on first draw: %016llx %016llx %x in %.1f ms\n",
+        if (sTraceWarmup) {
+            fprintf(stderr, "[vkcache] pipeline built on first draw: %016llx %016llx %x in %.1f ms\n",
                     (unsigned long long)prg->shader_id0, (unsigned long long)prg->shader_id1, key, MsSince(statStart));
         }
     }
@@ -2951,9 +3048,9 @@ void GfxRenderingAPIVK::EndFrame() {
     mFrameActive = false;
     mFrameSlot = (mFrameSlot + 1) % VK_FRAMES_IN_FLIGHT;
 
-    // the pipeline cache goes to disk every few seconds while new pipelines are created (not while workers add to it;
-    // the game exits with _exit, so there is no saving at shutdown)
-    if (mPipelineCacheDirty && MsSince(mPipelineCacheSaved) > 5000) {
+    // the pipeline cache goes to disk every few seconds while new pipelines are created (the warm-up workers save it
+    // themselves while they run, so the render thread never waits for one of their builds)
+    if (mPipelineCacheDirty && NowMs() - mPipelineCacheSavedMs > 5000.0) {
         std::unique_lock<std::mutex> lock(mPrebuildMutex);
         if (mPrebuildRunning == 0) {
             lock.unlock();

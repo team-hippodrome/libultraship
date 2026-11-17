@@ -141,6 +141,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetPerDrawUniforms();
     GLuint CompileProgram(const std::string& vertex, const std::string& fragment, bool dualSource);
     GLuint LoadProgramBinary(uint64_t key);
+    std::string ShaderCacheStats() override;
+    int mProgramBinaryHits = 0, mProgramCompiles = 0;
     void StoreProgramBinary(uint64_t key, GLuint program);
     ShaderDiskCache mShaderCache;
     std::string mDriverIdentity;
