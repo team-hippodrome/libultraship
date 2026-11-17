@@ -49,6 +49,8 @@ class RenderPipelineDescriptor;
 class ComputePipelineState;
 class CommandQueue;
 class Viewport;
+class Heap;
+class TextureDescriptor;
 } // namespace MTL
 
 namespace CA {
@@ -284,6 +286,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::chrono::steady_clock::time_point mPrebuildStart;
 
     std::vector<struct TextureDataMetal> mTextures;
+    // PORT: a scene change uploads ~300 small textures in one frame, nearly all of it MTLDevice newTexture. Textures are
+    // suballocated from heaps instead, one descriptor is reused and samplers are shared (see UploadTexture).
+    std::vector<MTL::Heap*> mTextureHeaps;
+    MTL::TextureDescriptor* mUploadDescriptor = nullptr;
+    MTL::SamplerState* mSamplerCache[2 * 4 * 4] = {};
     std::vector<FramebufferMetal> mFramebuffers;
     FrameUniforms mFrameUniforms;
     CoordUniforms mCoordUniforms;
