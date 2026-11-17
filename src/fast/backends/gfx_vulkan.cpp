@@ -953,6 +953,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     std::vector<VkExtensionProperties> devExts(devExtCount);
     vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &devExtCount, devExts.data());
     std::vector<const char*> enabledDevExts = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    bool hasDynamicStateExt = false;
     for (const auto& e : devExts) {
         if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
             enabledDevExts.push_back("VK_KHR_portability_subset");
@@ -961,6 +962,29 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
             enabledDevExts.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
             mHasMirrorClampToEdge = true;
         }
+        if (strcmp(e.extensionName, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) == 0) {
+            hasDynamicStateExt = true;
+        }
+    }
+    // PORT: depth test, depth write and the compare op as dynamic state (VK_EXT_extended_dynamic_state; core in 1.3):
+    // a program then needs one pipeline per (sample count, depth buffer) instead of one per depth/decal combination,
+    // so the warm-up covers every depth state a program is drawn with. PORT_VK_NO_DYNAMIC_DEPTH=1: the old static key.
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamicState = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT
+    };
+    if (hasDynamicStateExt && mDeviceProps.apiVersion >= VK_API_VERSION_1_1 && vkGetPhysicalDeviceFeatures2 != nullptr) {
+        VkPhysicalDeviceFeatures2 features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        features2.pNext = &dynamicState;
+        vkGetPhysicalDeviceFeatures2(mPhysicalDevice, &features2);
+        dynamicState.pNext = nullptr;
+    }
+    mDynamicDepth = dynamicState.extendedDynamicState && getenv("PORT_VK_NO_DYNAMIC_DEPTH") == nullptr;
+    if (mDynamicDepth) {
+        enabledDevExts.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    }
+    SPDLOG_INFO("Vulkan: depth state {}", mDynamicDepth ? "dynamic" : "in the pipeline");
+    if (sStats) {
+        fprintf(stderr, "[vkstats] depth state %s\n", mDynamicDepth ? "dynamic" : "in the pipeline");
     }
 
     float priority = 1.0f;
@@ -985,6 +1009,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     dci.enabledExtensionCount = (uint32_t)enabledDevExts.size();
     dci.ppEnabledExtensionNames = enabledDevExts.data();
     dci.pEnabledFeatures = &features;
+    dci.pNext = mDynamicDepth ? &dynamicState : nullptr;
     res = vkCreateDevice(mPhysicalDevice, &dci, nullptr, &mDevice);
     if (res != VK_SUCCESS) {
         SPDLOG_ERROR("Vulkan: vkCreateDevice failed ({})", (int)res);
@@ -1172,6 +1197,57 @@ GfxRenderingAPIVK::~GfxRenderingAPIVK() {
 
 // MARK: - Shader warm-up and the on-disk caches
 
+// The warm-up recipes (mPipelineList) keep a render state without its sample count: the low four bits are 0 for "the
+// MSAA setting" (the game's frame buffers) or 1 for a single-sampled buffer. The lists name the sample count each
+// pipeline was drawn with, which follows the setting of that run, so a recipe recorded with 4x still serves a player
+// with 2x (PORT, 2026-11: an HD 520 with 2x MSAA matched none of the shipped 1x pipelines and stalled 40-60 ms on each).
+void GfxRenderingAPIVK::AddPipelineRecipe(uint64_t shaderId0, uint64_t shaderId1, uint32_t state) {
+    auto& states = mPipelineList[{ shaderId0, shaderId1 }];
+    if (std::find(states.begin(), states.end(), state) == states.end()) {
+        states.push_back(state);
+    }
+}
+
+// a state from vulkan_pipelines.txt: 1x may have been the setting (the game's buffers) or a single-sampled buffer
+void GfxRenderingAPIVK::AddRecordedPipeline(uint64_t shaderId0, uint64_t shaderId1, uint32_t key) {
+    mKnownPipelines.insert({ shaderId0, shaderId1, key });
+    AddPipelineRecipe(shaderId0, shaderId1, key & ~15u);
+    if ((key & 15) == 1) {
+        AddPipelineRecipe(shaderId0, shaderId1, key);
+    }
+}
+
+// The sample count a frame buffer gets for a requested level: the next supported power of two below it
+uint32_t GfxRenderingAPIVK::ClampMsaa(uint32_t msaaLevel) const {
+    uint32_t level = 1;
+    while (level * 2 <= msaaLevel && level < 64) {
+        level *= 2;
+    }
+    while (level > 1 && (mDeviceProps.limits.framebufferColorSampleCounts & level) == 0) {
+        level /= 2;
+    }
+    return level;
+}
+
+// The part of a render state key a pipeline is built for: everything, or with dynamic depth state only the sample
+// count and the depth buffer (depth test, depth write and decal are set per draw)
+uint32_t GfxRenderingAPIVK::PipelineSlot(uint32_t key) const {
+    return mDynamicDepth ? (key & 0x1f) : key;
+}
+
+// the pipelines (PipelineSlot keys) to build ahead for a program's recipes, at the warm-up's sample count
+std::vector<uint32_t> GfxRenderingAPIVK::WarmPipelineSlots(const std::vector<uint32_t>& recipes) const {
+    std::vector<uint32_t> slots;
+    for (uint32_t state : recipes) {
+        const uint32_t msaa = (state & 15) == 1 ? 1 : mWarmMsaa;
+        const uint32_t slot = PipelineSlot((state & ~15u) | msaa);
+        if (std::find(slots.begin(), slots.end(), slot) == slots.end()) {
+            slots.push_back(slot);
+        }
+    }
+    return slots;
+}
+
 // vulkan_pipelines.txt: one "<shader id0> <shader id1> <render state key>" line (hex) per pipeline drawn so far
 void GfxRenderingAPIVK::LoadPipelineList() {
     FILE* f = fopen(mPipelineListPath.c_str(), "r");
@@ -1181,9 +1257,7 @@ void GfxRenderingAPIVK::LoadPipelineList() {
     unsigned long long id0, id1;
     unsigned key;
     while (fscanf(f, "%llx %llx %x", &id0, &id1, &key) == 3) {
-        if (mKnownPipelines.insert({ id0, id1, key }).second) {
-            mPipelineList[{ id0, id1 }].push_back(key);
-        }
+        AddRecordedPipeline(id0, id1, key);
     }
     fclose(f);
 }
@@ -1234,19 +1308,23 @@ bool GfxRenderingAPIVK::PrebuildShadersAsync(const std::vector<std::pair<uint64_
     std::lock_guard<std::mutex> lock(mPrebuildMutex);
     // The shared warm-up list covers programs. Vulkan also needs the render
     // state for each pipeline, even when the program is already compiled.
+    // port/vulkan_pipeline_warmup.txt (tools/vulkan_pipeline_list.py): recipes, sample count 0 = the MSAA setting
     if (sVKResourceManager) {
         auto archive = sVKResourceManager->GetArchiveManager();
         if (auto file = archive->LoadFile("port/vulkan_pipeline_warmup.txt"); file && file->Buffer) {
             std::istringstream recipes(std::string(file->Buffer->begin(), file->Buffer->end()));
-            uint64_t id0, id1;
-            uint32_t state;
-            while (recipes >> std::hex >> id0 >> id1 >> state) {
-                if (mKnownPipelines.insert({ id0, id1, state }).second) {
-                    mPipelineList[{ id0, id1 }].push_back(state);
+            std::string line;
+            while (std::getline(recipes, line)) {
+                unsigned long long id0, id1;
+                unsigned state;
+                if (line[0] != '#' && sscanf(line.c_str(), "%llx %llx %x", &id0, &id1, &state) == 3) {
+                    AddPipelineRecipe(id0, id1, (state & 15) > 1 ? state & ~15u : state);
                 }
             }
         }
     }
+    mWarmMsaa = ClampMsaa((uint32_t)std::max(
+        1, mConsoleVariable != nullptr ? mConsoleVariable->GetInteger(CVAR_MSAA_VALUE, 1) : 1));
     std::set<std::pair<uint64_t, uint64_t>> queued;
     for (const auto& [key, job] : mPrebuildQueue) {
         queued.insert(key);
@@ -1254,12 +1332,17 @@ bool GfxRenderingAPIVK::PrebuildShadersAsync(const std::vector<std::pair<uint64_
     auto add = [&](const std::pair<uint64_t, uint64_t>& key) {
         if (queued.insert(key).second) {
             auto it = mPipelineList.find(key);
-            mPrebuildQueue.push_back({ key, it != mPipelineList.end() ? it->second : std::vector<uint32_t>{} });
+            mPrebuildQueue.push_back(
+                { key, it != mPipelineList.end() ? WarmPipelineSlots(it->second) : std::vector<uint32_t>{} });
         }
     };
     for (const auto& key : ids) {
         add(key);
     }
+    // PORT: the start-up screen waits for these (the programs of the shared list, ordered by first use, with their
+    // pipelines); the workers build the rest while the game runs (a draw needing one that is still being built waits
+    // for it, one not started yet is built by the render thread)
+    mPrebuildBlocking = mPrebuildQueue.size();
     for (const auto& [key, states] : mPipelineList) { // drawn before, though not on the warm-up list
         add(key);
     }
@@ -1281,15 +1364,17 @@ bool GfxRenderingAPIVK::PrebuildShadersAsync(const std::vector<std::pair<uint64_
 
 float GfxRenderingAPIVK::ShaderPrebuildProgress() {
     std::lock_guard<std::mutex> lock(mPrebuildMutex);
-    if (mPrebuildQueue.empty()) return 1.0f;
-    return float(mPrebuildNext - mPrebuilding.size()) / float(mPrebuildQueue.size());
+    if (mPrebuildBlocking == 0 || mPrebuildBlockingDone >= mPrebuildBlocking) return 1.0f;
+    return float(mPrebuildBlockingDone) / float(mPrebuildBlocking);
 }
 
 void GfxRenderingAPIVK::PrebuildWorker() {
     std::unique_lock<std::mutex> lock(mPrebuildMutex);
     while (!mPrebuildStop && mPrebuildNext < mPrebuildQueue.size()) {
-        auto [key, states] = mPrebuildQueue[mPrebuildNext++];
+        const size_t index = mPrebuildNext++;
+        auto [key, states] = mPrebuildQueue[index];
         if (mPrebuildSkip.count(key) || mPrebuilt.count(key) || mPrebuilding.count(key)) {
+            mPrebuildBlockingDone += index < mPrebuildBlocking ? 1 : 0;
             continue;
         }
         mPrebuilding.insert(key);
@@ -1304,6 +1389,11 @@ void GfxRenderingAPIVK::PrebuildWorker() {
         mPrebuilding.erase(key);
         mPrebuilt[key] = std::move(built);
         mPrebuildBuilt++;
+        mPrebuildBlockingDone += index < mPrebuildBlocking ? 1 : 0;
+        if (sStats && mPrebuildBlockingDone == mPrebuildBlocking && index < mPrebuildBlocking) {
+            fprintf(stderr, "[vkstats] warm-up: start-up part (%zu programs) done in %.0f ms\n", mPrebuildBlocking,
+                    MsSince(mPrebuildStart));
+        }
         mPrebuildCond.notify_all();
     }
     if (--mPrebuildRunning == 0 && sStats) {
@@ -1449,6 +1539,7 @@ void GfxRenderingAPIVK::RenderDrawData(ImDrawData* drawData) {
     ImGui_ImplVulkan_RenderDrawData(drawData, fb.mCommandBuffer);
     // ImGui leaves arbitrary pipeline/descriptor/viewport state behind
     fb.mLastPipeline = VK_NULL_HANDLE;
+    fb.mLastDepthState = UINT32_MAX;
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
         fb.mLastBoundViews[i] = VK_NULL_HANDLE;
         fb.mLastBoundSamplers[i] = VK_NULL_HANDLE;
@@ -1670,6 +1761,7 @@ void GfxRenderingAPIVK::DestroyShaderProgram(ShaderProgramVK& prg) {
     prg.built.fs = VK_NULL_HANDLE;
     for (auto& fb : mFramebuffers) {
         fb.mLastPipeline = VK_NULL_HANDLE;
+        fb.mLastDepthState = UINT32_MAX;
     }
 }
 
@@ -1844,7 +1936,8 @@ void GfxRenderingAPIVK::SetUseAlpha(bool useAlpha) {
 }
 
 // The render state packed into a pipeline key: msaa level (bits 0-3), depth buffer (4), depth test (5), depth
-// write (6), decal (7). Thread-safe (warm-up workers build pipelines for the states listed in vulkan_pipelines.txt).
+// write (6), decal (7); with dynamic depth state (mDynamicDepth) bits 5-7 are 0, set per draw instead. Thread-safe
+// (warm-up workers build pipelines for the states listed in vulkan_pipelines.txt).
 VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t key) {
     if (prg.vs == VK_NULL_HANDLE || prg.fs == VK_NULL_HANDLE) {
         return VK_NULL_HANDLE;
@@ -1888,7 +1981,7 @@ VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t
     raster.cullMode = VK_CULL_MODE_NONE;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
-    raster.depthBiasEnable = decal ? VK_TRUE : VK_FALSE;
+    raster.depthBiasEnable = decal || mDynamicDepth ? VK_TRUE : VK_FALSE; // dynamic: a bias of 0 for the others
     raster.depthClampEnable = mHasDepthClamp ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo msaa = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
@@ -1926,10 +2019,14 @@ VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t
     blend.attachmentCount = 1;
     blend.pAttachments = &blendAttachment;
 
-    static const VkDynamicState dynamicStates[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                     VK_DYNAMIC_STATE_DEPTH_BIAS };
+    static const VkDynamicState dynamicStates[6] = { VK_DYNAMIC_STATE_VIEWPORT,
+                                                     VK_DYNAMIC_STATE_SCISSOR,
+                                                     VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                                     VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT,
+                                                     VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
+                                                     VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT };
     VkPipelineDynamicStateCreateInfo dynamic = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynamic.dynamicStateCount = 3;
+    dynamic.dynamicStateCount = mDynamicDepth ? 6 : 3;
     dynamic.pDynamicStates = dynamicStates;
 
     VkGraphicsPipelineCreateInfo pci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
@@ -1956,21 +2053,30 @@ VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t
     return pipeline;
 }
 
-// The program's pipeline for the current depth/decal/framebuffer state, created on first use (and recorded for the
-// warm-up of later runs).
+// The program's pipeline for the current depth/decal/framebuffer state, created on first use. Every full render
+// state drawn is recorded for the warm-up of later runs (also those a dynamic-state pipeline already serves: the
+// lists stay valid for drivers without it).
 VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, FramebufferVK& fb) {
     const uint32_t key = fb.mMsaaLevel | ((fb.mHasDepthBuffer ? 1u : 0) << 4) | ((mCurrentDepthTest ? 1u : 0) << 5) |
                          ((mCurrentDepthMask ? 1u : 0) << 6) | ((mCurrentZmodeDecal ? 1u : 0) << 7);
-    auto it = prg->built.pipelines.find(key);
+    const uint32_t slot = PipelineSlot(key);
+    VkPipeline pipeline;
+    auto it = prg->built.pipelines.find(slot);
     if (it != prg->built.pipelines.end()) {
-        return it->second;
+        pipeline = it->second;
+    } else {
+        const auto statStart = std::chrono::steady_clock::now();
+        pipeline = CreatePipeline(prg->built, slot);
+        sStat.pipelines++;
+        sStat.pipelineMs += MsSince(statStart);
+        prg->built.pipelines[slot] = pipeline;
+        if (sStats) {
+            fprintf(stderr, "[vkstats] pipeline built on first draw: %016llx %016llx %x in %.1f ms\n",
+                    (unsigned long long)prg->shader_id0, (unsigned long long)prg->shader_id1, key, MsSince(statStart));
+        }
     }
-    const auto statStart = std::chrono::steady_clock::now();
-    VkPipeline pipeline = CreatePipeline(prg->built, key);
-    sStat.pipelines++;
-    sStat.pipelineMs += MsSince(statStart);
-    prg->built.pipelines[key] = pipeline;
-    if (pipeline != VK_NULL_HANDLE) {
+    if (pipeline != VK_NULL_HANDLE && key < 256 && (prg->recordedKeys[key >> 6] & (1ull << (key & 63))) == 0) {
+        prg->recordedKeys[key >> 6] |= 1ull << (key & 63);
         RecordPipeline(prg->shader_id0, prg->shader_id1, key);
     }
     return pipeline;
@@ -1995,6 +2101,20 @@ void GfxRenderingAPIVK::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_
     if (pipeline != fb.mLastPipeline) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         fb.mLastPipeline = pipeline;
+    }
+    if (mDynamicDepth) { // as the static state in CreatePipeline
+        const bool test = fb.mHasDepthBuffer && (mCurrentDepthTest || mCurrentDepthMask);
+        const bool write = fb.mHasDepthBuffer && mCurrentDepthMask;
+        const VkCompareOp op =
+            mCurrentDepthTest ? (mCurrentZmodeDecal ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS)
+                              : VK_COMPARE_OP_ALWAYS;
+        const uint32_t depthState = (test ? 1u : 0) | (write ? 2u : 0) | ((uint32_t)op << 2);
+        if (depthState != fb.mLastDepthState) {
+            vkCmdSetDepthTestEnableEXT(cmd, test ? VK_TRUE : VK_FALSE);
+            vkCmdSetDepthWriteEnableEXT(cmd, write ? VK_TRUE : VK_FALSE);
+            vkCmdSetDepthCompareOpEXT(cmd, op);
+            fb.mLastDepthState = depthState;
+        }
     }
 
     // Decal depth bias (as gfx_metal.cpp: slope-scaled, -2 at 240p)
@@ -2150,6 +2270,7 @@ void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
 
     // Rebound in every pass (ImGui and readback submits change the bindings)
     fb.mLastPipeline = VK_NULL_HANDLE;
+    fb.mLastDepthState = UINT32_MAX;
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
         fb.mLastBoundViews[i] = VK_NULL_HANDLE;
         fb.mLastBoundSamplers[i] = VK_NULL_HANDLE;
@@ -2283,10 +2404,7 @@ void GfxRenderingAPIVK::UpdateFramebufferParameters(int fbId, uint32_t width, ui
 
     width = std::max(width, 1u);
     height = std::max(height, 1u);
-    msaaLevel = std::max(msaaLevel, 1u);
-    while (msaaLevel > 1 && (mDeviceProps.limits.framebufferColorSampleCounts & msaaLevel) == 0) {
-        msaaLevel--;
-    }
+    msaaLevel = ClampMsaa(msaaLevel); // a supported power of two (counting down by 1 could reach 3, 5, 6 or 7)
 
     bool diff = fb.mWidth != width || fb.mHeight != height || fb.mMsaaLevel != msaaLevel ||
                 fb.mHasDepthBuffer != has_depth_buffer || fb.mRenderTarget != render_target;
@@ -2824,6 +2942,7 @@ void GfxRenderingAPIVK::EndFrame() {
         fb.mCommandBuffer = VK_NULL_HANDLE;
         fb.mPassActive = false;
         fb.mLastPipeline = VK_NULL_HANDLE;
+        fb.mLastDepthState = UINT32_MAX;
         fb.mLastDepthBias = 0.0f;
         memset(&fb.mViewport, 0, sizeof(fb.mViewport));
         memset(&fb.mScissor, 0, sizeof(fb.mScissor));
