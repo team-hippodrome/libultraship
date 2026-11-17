@@ -9,6 +9,7 @@
 #include <vector>
 #include <stack>
 #include <string>
+#include <chrono>
 #include <string_view>
 #include <memory>
 
@@ -581,6 +582,8 @@ class Interpreter {
     uint8_t* mTexUploadBuffer = nullptr;
     std::vector<std::pair<uint64_t, uint64_t>> mWarmupQueue; // PORT: QueueShaderWarmup, built by WarmupStep
     size_t mWarmupNext = 0;
+    std::chrono::steady_clock::time_point mWarmupStart; // PORT: for the warm-up log line
+    double mWarmupBusyMs = 0.0;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};

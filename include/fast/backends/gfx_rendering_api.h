@@ -4,6 +4,7 @@
 
 #include <unordered_map>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 #include "imconfig.h"
@@ -53,6 +54,8 @@ class GfxRenderingAPI {
         return false;
     }
     virtual float ShaderPrebuildProgress() { return 1.0f; }
+    // PORT: how the program builds so far used the on-disk caches, for the warm-up log line ("" when not tracked)
+    virtual std::string ShaderCacheStats() { return ""; }
     virtual uint32_t NewTexture() = 0;
     virtual void SelectTexture(int tile, uint32_t textureId) = 0;
     virtual void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) = 0;

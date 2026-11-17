@@ -29,6 +29,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <stdexcept>
 
@@ -100,6 +101,7 @@ struct ShaderProgramVK {
     uint8_t numInputs;
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool markedForDeletion = false;
+    uint64_t recordedKeys[4] = {}; // render state keys (< 256) already written to vulkan_pipelines.txt
 
     // Modules, vertex layout (the interpreter's packing order; fixed locations, see the shader template) and the
     // pipelines keyed by packed render state (msaa level, depth buffer, depth test/write, decal), created lazily
@@ -152,6 +154,7 @@ struct FramebufferVK {
     VkImageView mLastBoundViews[SHADER_MAX_TEXTURES] = {};
     VkSampler mLastBoundSamplers[SHADER_MAX_TEXTURES] = {};
     float mLastDepthBias = 0.0f;
+    uint32_t mLastDepthState = UINT32_MAX; // dynamic depth test/write/compare op last set in the pass
     VkViewport mViewport = {};
     VkRect2D mScissor = {};
 };
@@ -287,8 +290,14 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     VkPipeline GetPipelineForState(ShaderProgramVK* prg, FramebufferVK& fb);
     void PrebuildWorker();
     void LoadPipelineList();
+    void AddPipelineRecipe(uint64_t shaderId0, uint64_t shaderId1, uint32_t state);
+    void AddRecordedPipeline(uint64_t shaderId0, uint64_t shaderId1, uint32_t key);
+    uint32_t ClampMsaa(uint32_t msaaLevel) const;
+    uint32_t PipelineSlot(uint32_t key) const;
+    std::vector<uint32_t> WarmPipelineSlots(const std::vector<uint32_t>& recipes) const;
     void RecordPipeline(uint64_t shaderId0, uint64_t shaderId1, uint32_t key);
     void SavePipelineCache();
+    void MaybeSavePipelineCache();
     void DestroyShaderProgram(ShaderProgramVK& prg);
     void EnsureUploadCmd();
     void GrowStaging(FrameSlot& slot, size_t needed);
@@ -315,6 +324,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     bool mHasMirrorClampToEdge = false;
     bool mHasDepthClamp = false;
     bool mHasDualSrcBlend = false;
+    bool mDynamicDepth = false; // VK_EXT_extended_dynamic_state: depth test/write/compare op set per draw
 
     VkSwapchainKHR mSwapchain = VK_NULL_HANDLE;
     VkFormat mSwapchainFormat = VK_FORMAT_B8G8R8A8_UNORM;
@@ -352,6 +362,8 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     std::condition_variable mPrebuildCond;
     std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint32_t>>> mPrebuildQueue;
     size_t mPrebuildNext = 0;
+    size_t mPrebuildBlocking = 0;     // the first queue entries, which the start-up screen waits for
+    size_t mPrebuildBlockingDone = 0; // of those, the ones finished (built or skipped)
     bool mPrebuildThreePoint = false;
     bool mPrebuildSrgb = false;
     std::map<std::pair<uint64_t, uint64_t>, BuiltProgramVK> mPrebuilt;  // finished, not yet drawn
@@ -362,12 +374,20 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     int mPrebuildRunning = 0;
     size_t mPrebuildBuilt = 0;
     std::chrono::steady_clock::time_point mPrebuildStart;
+    // warm-up recipes per program: render states with sample count 0 (the MSAA setting) or 1 (single-sampled)
     std::map<std::pair<uint64_t, uint64_t>, std::vector<uint32_t>> mPipelineList;
+    uint32_t mWarmMsaa = 1; // the sample count the warm-up builds the game's frame buffers' pipelines for
     std::set<std::tuple<uint64_t, uint64_t, uint32_t>> mKnownPipelines;
     std::string mPipelineListPath;
     std::string mPipelineCachePath;
     std::atomic<bool> mPipelineCacheDirty{ false }; // set by workers too
-    std::chrono::steady_clock::time_point mPipelineCacheSaved;
+    std::atomic<double> mPipelineCacheSavedMs{ 0.0 };  // steady clock
+    std::shared_mutex mPipelineCacheLock;              // shared: creating a pipeline; exclusive: saving the cache
+    std::atomic<int> mPipelineCacheSaves{ 0 };
+    std::atomic<int> mPipelinesCreated{ 0 };
+    std::atomic<int> mPipelineCacheHits{ 0 }; // creation feedback: found in the pipeline cache
+    size_t mPipelineCacheLoadedBytes = 0;
+    bool mHasCreationFeedback = false;
 
     std::map<uint32_t, VkRenderPass> mRenderPassCache; // key: msaa | (hasDepth << 8)
     std::map<uint32_t, VkSampler> mSamplerCache;       // key: linear | cms<<1 | cmt<<9 | filter mode<<17
