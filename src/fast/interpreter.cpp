@@ -456,8 +456,19 @@ static int sAnchor = 0;
 // PORT: frame interpolation of frames that draw over the previous picture (Interpreter::ReplayBegin): a copy of each game
 // frame buffer's picture from before the frame, and the buffers already copied away/back in this drawing
 static bool sReplayRestore = false;
-static std::unordered_map<uintptr_t, std::pair<int, uint32_t>> sSnapFbs; // framebuffer, its MSAA level
+// A copy only lives from a game frame's first drawing to its last repeat, and the frames are drawn one after the other:
+// the copies are a small pool of full size targets (one per buffer the series copies), not one per buffer address.
+struct SnapFb {
+    int fb = 0;
+    uint32_t msaa = 0;   // MSAA level it is sized for (0: not sized, 1x1)
+    uint64_t used = 0;   // host frame of its last copy
+};
+static std::vector<SnapFb> sSnapPool;
+static std::unordered_map<uintptr_t, size_t> sSnapSeries; // buffer address -> pool index, for the current series
 static std::unordered_set<uintptr_t> sSnapDoneThisRun;
+static uint64_t sHostFrameNo = 0;
+// a copy unused for this many host frames gives its (full size, multisampled) textures back until it is needed again
+static constexpr uint64_t kSnapIdleFrames = 90;
 // PORT: 2D in-between frames (Interpreter::mReplayT): the rectangles of the last exact drawing by key, in drawing order
 struct Interp2DKey {
     const void* tex;
@@ -4625,16 +4636,24 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
             const bool window = ViewportMatchesRendererResolution();
             const uint32_t w = window ? mGfxCurrentWindowDimensions.width : mCurDimensions.width;
             const uint32_t h = window ? mGfxCurrentWindowDimensions.height : mCurDimensions.height;
-            auto& entry = sSnapFbs[(uintptr_t)address];
-            if (entry.first == 0) {
-                entry.first = mRapi->CreateFramebuffer();
+            auto series = sSnapSeries.find((uintptr_t)address);
+            if (series == sSnapSeries.end()) {
+                series = sSnapSeries.emplace((uintptr_t)address, sSnapSeries.size()).first;
             }
-            if (entry.second != mMsaaLevel) {
-                entry.second = mMsaaLevel;
-                mRapi->UpdateFramebufferParameters(entry.first, w, h, mMsaaLevel, window ? mMsaaLevel <= 1 : true, true,
-                                                   true, true);
+            if (series->second >= sSnapPool.size()) {
+                sSnapPool.resize(series->second + 1);
             }
-            const int snap = entry.first;
+            SnapFb& entry = sSnapPool[series->second];
+            entry.used = sHostFrameNo;
+            if (entry.fb == 0) {
+                entry.fb = mRapi->CreateFramebuffer();
+            }
+            if (entry.msaa != mMsaaLevel) {
+                entry.msaa = mMsaaLevel;
+                mRapi->UpdateFramebufferParameters(entry.fb, w, h, mMsaaLevel, window ? mMsaaLevel <= 1 : true, true,
+                                                   false, false);
+            }
+            const int snap = entry.fb;
             Flush();
             if (!mReplayPass) {
                 mRapi->CopyFramebufferInStream(fb, snap, fb, (int)w, (int)h);
@@ -6802,6 +6821,7 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 }
 
 void Interpreter::StartFrame() {
+    sHostFrameNo++;
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
@@ -6840,21 +6860,32 @@ void Interpreter::StartFrame() {
                 fbs.push_back(e.second);
             }
         }
-        for (auto& e : sSnapFbs) { // (frame interpolation's copies of them)
-            fbs.push_back(e.second.first);
-            e.second.second = mMsaaLevel;
+        const size_t mainCount = fbs.size();
+        // frame interpolation's copies of them only ever hold a picture: no depth buffer
+        for (auto& e : sSnapPool) {
+            if (e.msaa != 0 && sHostFrameNo - e.used > kSnapIdleFrames) {
+                mRapi->UpdateFramebufferParameters(e.fb, 1, 1, 1, true, true, false, false);
+                e.msaa = 0; // (sized again by the next drawing that copies the picture away)
+            }
+            if (e.msaa == 0) {
+                continue;
+            }
+            fbs.push_back(e.fb);
+            e.msaa = mMsaaLevel;
         }
-        for (int fb : fbs) {
+        for (size_t i = 0; i < fbs.size(); i++) {
+            const int fb = fbs[i];
+            const bool depth = i < mainCount;
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->UpdateFramebufferParameters(fb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
-                                                   true, true, true);
+                                                   true, depth, depth);
             } else {
                 // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
                 // match the window size
                 // PORT: Y-inverted when shown as a texture (see above): only an MSAA resolve goes into the window
                 mRapi->UpdateFramebufferParameters(fb, mGfxCurrentWindowDimensions.width,
                                                    mGfxCurrentWindowDimensions.height, mMsaaLevel, mMsaaLevel <= 1, true,
-                                                   true, true);
+                                                   depth, depth);
             }
         }
         if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
@@ -7252,6 +7283,7 @@ bool Interpreter::CanRestorePicture() const {
 
 void Interpreter::ReplayBegin(bool restorePicture) {
     sReplayRestore = restorePicture;
+    sSnapSeries.clear(); // (a new game frame: its copies are taken anew)
     if (sReplay == nullptr) sReplay = new ReplayState();
     ReplayState& r = *sReplay;
     r.rspStart = *mRsp;

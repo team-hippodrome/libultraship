@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -285,6 +286,10 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     std::vector<struct TextureDataMetal> mTextures;
     std::vector<FramebufferMetal> mFramebuffers;
+    // The multisampled depth textures, one per size and sample count shared by the render targets that have one: like the
+    // N64's single Z buffer, only the drawing in progress needs it (a target gets its depth cleared when it is selected)
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, MTL::Texture*> mSharedMsaaDepth;
+    MTL::Texture* AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level);
     FrameUniforms mFrameUniforms;
     CoordUniforms mCoordUniforms;
     DrawUniforms mDrawUniforms;

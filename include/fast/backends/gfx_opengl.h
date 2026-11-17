@@ -1,7 +1,9 @@
 #ifdef ENABLE_OPENGL
 #pragma once
 
+#include <map>
 #include <memory>
+#include <tuple>
 #include "gfx_rendering_api.h"
 #include "gfx_shader_cache.h"
 #include "../interpreter.h"
@@ -64,6 +66,7 @@ struct FramebufferOGL {
     bool invertY;
 
     GLuint fbo, clrbuf, clrbufMsaa, rbo;
+    GLuint attachedDepth; // the renderbuffer attached as depth/stencil: rbo, a shared multisampled one, or 0
 };
 
 /**
@@ -169,6 +172,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     uint32_t mFrameCount = 0;
 
     std::vector<FramebufferOGL> mFrameBuffers;
+    // Multisampled depth renderbuffers, one per size and sample count shared by the framebuffers that have one: like the
+    // N64's single Z buffer, only the drawing in progress needs it (a framebuffer gets its depth cleared when selected)
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, GLuint> mSharedMsaaDepth;
+    GLuint AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level);
     size_t mCurrentFrameBuffer = 0;
     float mCurrentNoiseScale = 0.0f;
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
