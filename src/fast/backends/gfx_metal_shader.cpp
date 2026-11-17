@@ -31,6 +31,8 @@ void gfx_metal_shader_set_resource_manager(std::shared_ptr<Ship::ResourceManager
 
 // random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
 #define RAND_NOISE "random(float3(floor(in.position.xy * frameUniforms.noiseScale), float(frameUniforms.frameCount)))"
+// PORT: the colour combiner's NOISE input as the RDP makes it (n64_noise() in the shader template)
+#define N64_NOISE "n64_noise(" RAND_NOISE ")"
 
 static const char* p_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                         bool first_cycle, bool hint_single_element) {
@@ -73,8 +75,7 @@ static const char* p_shader_item_to_str(uint32_t item, bool with_alpha, bool onl
             case SHADER_COMBINED:
                 return with_alpha ? "texel" : "texel.xyz";
             case SHADER_NOISE:
-                return with_alpha ? "float4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
-                                  : "float3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
+                return with_alpha ? "float4(float3(" N64_NOISE "), " RAND_NOISE ")" : "float3(" N64_NOISE ")";
         }
     } else {
         switch (item) {

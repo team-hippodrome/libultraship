@@ -1475,6 +1475,8 @@ void GfxRenderingAPIDX11::SetSrgbMode() {
 
 // random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
 #define RAND_NOISE "random(float3(floor(screenSpace.xy * noise_scale), noise_frame))"
+// PORT: the colour combiner's NOISE input as the RDP makes it (n64_noise() in the shader template)
+#define N64_NOISE "n64_noise(" RAND_NOISE ")"
 
 static const char* prism_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                             bool first_cycle, bool hint_single_element) {
@@ -1518,8 +1520,7 @@ static const char* prism_shader_item_to_str(uint32_t item, bool with_alpha, bool
             case SHADER_COMBINED:
                 return with_alpha ? "texel" : "texel.rgb";
             case SHADER_NOISE:
-                return with_alpha ? "float4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
-                                  : "float3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
+                return with_alpha ? "float4(" N64_NOISE ".xxx, " RAND_NOISE ")" : "float3(" N64_NOISE ".xxx)";
         }
     } else {
         switch (item) {

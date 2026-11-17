@@ -164,6 +164,15 @@ float random(float3 value) {
     return fract(sin(random) * 143758.5453);
 }
 
+// PORT: the colour combiner's NOISE input as the RDP makes it: ((rand & 7) << 6) | 0x20, read as a 9-bit
+// input (32, 96, 160, 224, 288, 352, then -96 and -32, of 255). Its mean is about 0.5, but the two values
+// over 255 wrap to negative ones when the next cycle multiplies by them (powder and mist effects:
+// (PRIM - ENV) * COMBINED + ENV stays close to ENV), so a uniform [0, 1) noise came out far too light.
+float n64_noise(float r) {
+    float v = floor(r * 8.0) * 64.0 + 32.0;
+    return (v >= 384.0 ? v - 512.0 : v) / 255.0;
+}
+
 fragment FragOut fragmentShader(
     ProjectedVertex in [[stage_in]],
     constant FrameUniforms &frameUniforms [[buffer(0)]],

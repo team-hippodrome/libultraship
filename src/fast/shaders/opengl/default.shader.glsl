@@ -147,6 +147,19 @@
         return fract(sin(random) * 143758.5453);
     }
 
+    // PORT: the colour combiner's NOISE input as the RDP makes it: ((rand & 7) << 6) | 0x20, read as a 9-bit
+    // input (32, 96, 160, 224, 288, 352, then -96 and -32, of 255). Its mean is about 0.5, but the two values
+    // over 255 wrap to negative ones when the next cycle multiplies by them (powder and mist effects:
+    // (PRIM - ENV) * COMBINED + ENV stays close to ENV), so a uniform [0, 1) noise came out far too light.
+    float n64_noise(in float r) {
+        float v = floor(r * 8.0) * 64.0 + 32.0;
+        return (v >= 384.0 ? v - 512.0 : v) / 255.0;
+    }
+
+    // PORT: the second cycle's multiplier is a 9-bit signed input on the RDP: a first-cycle result over 1 wraps to a
+    // negative one there (n64_noise). WRAP stays a clamp everywhere else (upstream #1096).
+    #define WRAP_MUL(x) (mod((x) + 1.01, 2.02) - 1.01)
+
     vec4 fromLinear(vec4 linearRGB){
         bvec3 cutoff = lessThan(linearRGB.rgb, vec3(0.0031308));
         vec3 higher = vec3(1.055)*pow(linearRGB.rgb, vec3(1.0/2.4)) - vec3(0.055);
@@ -232,14 +245,14 @@
             @if(c == 1)
                 @if(o_alpha)
                     @if(o_c[c][1][2] == SHADER_COMBINED)
-                        texel.a = WRAP(texel.a, -1.01, 1.01);
+                        texel.a = WRAP_MUL(texel.a);
                     @else
                         texel.a = WRAP(texel.a, -0.51, 1.51);
                     @end
                 @end
 
                 @if(o_c[c][0][2] == SHADER_COMBINED)
-                    texel.rgb = WRAP(texel.rgb, -1.01, 1.01);
+                    texel.rgb = WRAP_MUL(texel.rgb);
                 @else
                     texel.rgb = WRAP(texel.rgb, -0.51, 1.51);
                 @end

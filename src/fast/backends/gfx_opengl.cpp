@@ -112,6 +112,8 @@ void GfxRenderingAPIOGL::LoadShader(ShaderProgram* new_prg) {
 
 // random() is already in [0, 1), like the RDP's noise (PORT: was mapped again as if it were in [-1, 1])
 #define RAND_NOISE "random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count)))"
+// PORT: the colour combiner's NOISE input as the RDP makes it (n64_noise() in the shader templates)
+#define N64_NOISE "n64_noise(" RAND_NOISE ")"
 
 static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
                                       bool first_cycle, bool hint_single_element) {
@@ -154,8 +156,7 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
             case SHADER_COMBINED:
                 return with_alpha ? "texel" : "texel.rgb";
             case SHADER_NOISE:
-                return with_alpha ? "vec4(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")"
-                                  : "vec3(" RAND_NOISE ", " RAND_NOISE ", " RAND_NOISE ")";
+                return with_alpha ? "vec4(vec3(" N64_NOISE "), " RAND_NOISE ")" : "vec3(" N64_NOISE ")";
         }
     } else {
         switch (item) {
