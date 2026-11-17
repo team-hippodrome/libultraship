@@ -5,7 +5,21 @@
 #include <filesystem>
 #include <unordered_map>
 #include <any>
+#include <cstdio>
+#include <mutex>
 #include <spdlog/spdlog.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "ship/utils/StringHelper.h"
 #include "ship/window/Window.h"
 
@@ -217,10 +231,54 @@ void Config::Reload() {
     } catch (const std::exception& e) { SPDLOG_ERROR("Unexpected error loading config file {}: {}", mPath, e.what()); }
 }
 
+// The file is written next to the config under a temporary name and then renamed over it, so the config on disk is
+// always either the old or the new file. Writing in place truncated it first: a process that ended during the write
+// (a crash, a terminate, _exit on another thread) left an empty or cut-off config behind.
 void Config::Save() {
-    std::ofstream file(fs::u8path(mPath));
+    static std::mutex saveMutex; // one temporary file per config path: two saves at once must not share it
+    std::lock_guard<std::mutex> lock(saveMutex);
     mNestedJson = mFlattenedJson.unflatten();
-    file << mNestedJson.dump(4);
+    if (mPath == "None") {
+        return;
+    }
+    const std::string text = mNestedJson.dump(4);
+    const fs::path path = fs::u8path(mPath);
+    const fs::path temporary = fs::u8path(mPath + ".tmp");
+#ifdef _WIN32
+    FILE* file = _wfopen(temporary.c_str(), L"wb");
+#else
+    FILE* file = fopen(temporary.c_str(), "wb");
+#endif
+    if (file == nullptr) {
+        SPDLOG_ERROR("Failed to save config file {}: cannot create {}", mPath, temporary.string());
+        return;
+    }
+    bool ok = fwrite(text.data(), 1, text.size(), file) == text.size() && fflush(file) == 0;
+#ifdef _WIN32
+    ok = ok && _commit(_fileno(file)) == 0;
+#else
+    ok = ok && fsync(fileno(file)) == 0;
+#endif
+    ok = fclose(file) == 0 && ok;
+    std::error_code ec;
+    if (!ok) {
+        fs::remove(temporary, ec);
+        SPDLOG_ERROR("Failed to save config file {}: write failed; the previous file was kept", mPath);
+        return;
+    }
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const unsigned long error = GetLastError();
+        fs::remove(temporary, ec);
+        SPDLOG_ERROR("Failed to save config file {}: cannot replace it (error {}); the previous file was kept", mPath,
+                     error);
+    }
+#else
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+        fs::remove(temporary, ec);
+        SPDLOG_ERROR("Failed to save config file {}: cannot replace it; the previous file was kept", mPath);
+    }
+#endif
 }
 
 template <typename T> std::vector<T> Config::GetArray(const std::string& key) {
