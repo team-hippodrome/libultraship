@@ -93,7 +93,7 @@ struct ProjectedVertex {
             float3 input@{i + 1};
         @end
     @end
-    // PORT: the RDP shades linearly across the screen; inputs go out multiplied by w and are divided by the
+    // The RDP shades linearly in screen space; inputs go out multiplied by w and are divided by the
     // interpolated w in the fragment shader, which cancels the perspective weighting (see the OpenGL shader)
     float shadeW;
     float4 position [[position]];

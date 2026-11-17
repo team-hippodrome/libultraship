@@ -48,7 +48,7 @@
             @{update_floats(3)}
         @end
     @end
-    // PORT: the RDP interpolates shade (and the fog in it) linearly across the screen; only texture coordinates get
+    // The RDP interpolates shade (and the fog in it) linearly in screen space; only texture coordinates get
     // perspective correction. Inputs go out multiplied by w and are divided by the interpolated w in the fragment
     // shader, which cancels the perspective weighting (and stays right where the GPU clips at the near plane).
     @{out} float vShadeW;

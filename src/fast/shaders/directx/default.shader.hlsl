@@ -46,7 +46,7 @@ float4 grayscale : GRAYSCALE;
         @{update_floats(3)}
     @end
 @end
-// PORT: the RDP shades linearly across the screen; inputs go out multiplied by w and are divided by the
+// The RDP shades linearly in screen space; inputs go out multiplied by w and are divided by the
 // interpolated w in the pixel shader, which cancels the perspective weighting (see the OpenGL shader)
 float shadeW : SHADEW;
 };
