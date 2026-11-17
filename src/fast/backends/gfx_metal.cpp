@@ -1166,6 +1166,33 @@ static bool DrawOldPictureScaled(MTL::Device* device, MTL::CommandQueue* queue, 
     return true;
 }
 
+MTL::Texture* GfxRenderingAPIMetal::AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level) {
+    // textures of sizes no target has any more (window resized) are given back first
+    for (auto it = mSharedMsaaDepth.begin(); it != mSharedMsaaDepth.end();) {
+        if (it->second->retainCount() == 1) {
+            it->second->release();
+            it = mSharedMsaaDepth.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const auto key = std::make_tuple(width, height, msaa_level);
+    auto it = mSharedMsaaDepth.find(key);
+    if (it == mSharedMsaaDepth.end()) {
+        MTL::TextureDescriptor* desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatDepth32Float, width, height, true);
+        desc->setTextureType(MTL::TextureType2DMultisample);
+        desc->setStorageMode(MTL::StorageModePrivate);
+        desc->setSampleCount(msaa_level);
+        desc->setArrayLength(1);
+        desc->setMipmapLevelCount(1);
+        desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        it = mSharedMsaaDepth.emplace(key, mDevice->newTexture(desc)).first;
+    }
+    it->second->retain(); // (the caller's reference)
+    return it->second;
+}
+
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                        bool can_extract_depth) {
@@ -1223,6 +1250,10 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             if (tex.msaaTexture != nullptr)
                 tex.msaaTexture->release();
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
+        } else if (tex.msaaTexture != nullptr) {
+            // (a target that is no longer multisampled gives the multisampled texture back)
+            tex.msaaTexture->release();
+            tex.msaaTexture = nullptr;
         }
 
         bool kept = old_texture != nullptr && DrawOldPictureScaled(mDevice, mCommandQueue, old_texture, tex.texture,
@@ -1284,13 +1315,13 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
         fb.mDepthTexture = mDevice->newTexture(depth_tex_desc);
 
         if (msaa_level > 1) {
-            depth_tex_desc->setTextureType(MTL::TextureType2DMultisample);
-            depth_tex_desc->setSampleCount(msaa_level);
-
             if (fb.mMsaaDepthTexture != nullptr)
                 fb.mMsaaDepthTexture->release();
 
-            fb.mMsaaDepthTexture = mDevice->newTexture(depth_tex_desc);
+            fb.mMsaaDepthTexture = AcquireMsaaDepth(width, height, msaa_level);
+        } else if (fb.mMsaaDepthTexture != nullptr) {
+            fb.mMsaaDepthTexture->release();
+            fb.mMsaaDepthTexture = nullptr;
         }
     }
 
