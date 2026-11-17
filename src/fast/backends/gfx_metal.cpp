@@ -559,6 +559,13 @@ GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
     for (auto& t : mPrebuildThreads) {
         t.join();
     }
+    for (auto& fb : mFramebuffers) {
+        fb.mMsaaDepthTexture = nullptr;
+    }
+    for (auto& [key, shared] : mSharedMsaaDepth) {
+        shared.texture->release();
+    }
+    mSharedMsaaDepth.clear();
 }
 
 // PORT: the program's pipeline for an msaa level, built on first use
@@ -1167,15 +1174,6 @@ static bool DrawOldPictureScaled(MTL::Device* device, MTL::CommandQueue* queue, 
 }
 
 MTL::Texture* GfxRenderingAPIMetal::AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level) {
-    // textures of sizes no target has any more (window resized) are given back first
-    for (auto it = mSharedMsaaDepth.begin(); it != mSharedMsaaDepth.end();) {
-        if (it->second->retainCount() == 1) {
-            it->second->release();
-            it = mSharedMsaaDepth.erase(it);
-        } else {
-            ++it;
-        }
-    }
     const auto key = std::make_tuple(width, height, msaa_level);
     auto it = mSharedMsaaDepth.find(key);
     if (it == mSharedMsaaDepth.end()) {
@@ -1187,10 +1185,26 @@ MTL::Texture* GfxRenderingAPIMetal::AcquireMsaaDepth(uint32_t width, uint32_t he
         desc->setArrayLength(1);
         desc->setMipmapLevelCount(1);
         desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
-        it = mSharedMsaaDepth.emplace(key, mDevice->newTexture(desc)).first;
+        it = mSharedMsaaDepth.emplace(key, SharedMsaaDepth{ mDevice->newTexture(desc), 0 }).first;
     }
-    it->second->retain(); // (the caller's reference)
-    return it->second;
+    it->second.uses++;
+    return it->second.texture;
+}
+
+// Gives up one use of a texture from AcquireMsaaDepth; the last one releases it
+void GfxRenderingAPIMetal::ReleaseMsaaDepth(MTL::Texture* texture) {
+    if (texture == nullptr) {
+        return;
+    }
+    for (auto it = mSharedMsaaDepth.begin(); it != mSharedMsaaDepth.end(); ++it) {
+        if (it->second.texture == texture) {
+            if (--it->second.uses == 0) {
+                it->second.texture->release();
+                mSharedMsaaDepth.erase(it);
+            }
+            return;
+        }
+    }
 }
 
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
@@ -1314,15 +1328,14 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
 
         fb.mDepthTexture = mDevice->newTexture(depth_tex_desc);
 
-        if (msaa_level > 1) {
-            if (fb.mMsaaDepthTexture != nullptr)
-                fb.mMsaaDepthTexture->release();
-
-            fb.mMsaaDepthTexture = AcquireMsaaDepth(width, height, msaa_level);
-        } else if (fb.mMsaaDepthTexture != nullptr) {
-            fb.mMsaaDepthTexture->release();
-            fb.mMsaaDepthTexture = nullptr;
-        }
+        // acquire before releasing, so a target that keeps its size and sample count doesn't recreate the texture
+        MTL::Texture* old_msaa_depth = fb.mMsaaDepthTexture;
+        fb.mMsaaDepthTexture = msaa_level > 1 ? AcquireMsaaDepth(width, height, msaa_level) : nullptr;
+        ReleaseMsaaDepth(old_msaa_depth);
+    } else if (!has_depth_buffer && fb.mMsaaDepthTexture != nullptr) {
+        // a target without depth needs none (it gets one again when it regains depth, as mHasDepthBuffer was false)
+        ReleaseMsaaDepth(fb.mMsaaDepthTexture);
+        fb.mMsaaDepthTexture = nullptr;
     }
 
     if (has_depth_buffer && fb.mRenderPassDescriptor != nullptr) {

@@ -295,8 +295,15 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::vector<FramebufferMetal> mFramebuffers;
     // The multisampled depth textures, one per size and sample count shared by the render targets that have one: like the
     // N64's single Z buffer, only the drawing in progress needs it (a target gets its depth cleared when it is selected)
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, MTL::Texture*> mSharedMsaaDepth;
+    // Each target holding one counts as a use; a texture is released when its last user lets go (command buffers that
+    // still draw into it keep it alive on the GPU until they finish).
+    struct SharedMsaaDepth {
+        MTL::Texture* texture;
+        uint32_t uses;
+    };
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, SharedMsaaDepth> mSharedMsaaDepth;
     MTL::Texture* AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level);
+    void ReleaseMsaaDepth(MTL::Texture* texture);
     FrameUniforms mFrameUniforms;
     CoordUniforms mCoordUniforms;
     DrawUniforms mDrawUniforms;
