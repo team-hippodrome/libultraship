@@ -278,7 +278,8 @@ struct RSP {
         uint16_t s, t;
     } texture_scaling_factor;
 
-    struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
+    // PORT: 4 slots for rectangles, then room for the vertices of a triangle clipped as the RSP clips it (GfxSpTri1)
+    struct LoadedVertex loaded_vertices[MAX_VERTICES + 4 + 16];
 };
 
 struct RDP {
@@ -611,6 +612,7 @@ class Interpreter {
     uintptr_t mSegmentPointers[MAX_SEGMENT_POINTERS]{};
 
     bool mFbActive{};
+    bool mInRspClip{}; // PORT: GfxSpTri1 is drawing the pieces of a triangle it clipped
     bool mRendersToFb{}; // game_renders_to_framebuffer;
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;

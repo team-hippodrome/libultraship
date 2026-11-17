@@ -31,7 +31,7 @@
 
     @if(o_fog)
         layout(location = 7) in vec4 aFog;
-        layout(location = 7) out vec4 vFog;
+        layout(location = 7) out vec4 vFogW;
     @end
 
     @if(o_grayscale)
@@ -42,12 +42,17 @@
     @for(i in 0..o_inputs)
         @if(o_alpha)
             layout(location = @{9 + i}) in vec4 aInput@{i + 1};
-            layout(location = @{9 + i}) out vec4 vInput@{i + 1};
+            layout(location = @{9 + i}) out vec4 vInputW@{i + 1};
         @else
             layout(location = @{9 + i}) in vec3 aInput@{i + 1};
-            layout(location = @{9 + i}) out vec3 vInput@{i + 1};
+            layout(location = @{9 + i}) out vec3 vInputW@{i + 1};
         @end
     @end
+
+    // PORT: the RDP shades linearly across the screen; inputs go out multiplied by w and are divided by the
+    // interpolated w in the fragment shader, which cancels the perspective weighting (see the OpenGL shader).
+    // Varying location 0 is free (attribute 0 is the position).
+    layout(location = 0) out float vShadeW;
 
     void main() {
         @for(i in 0..2)
@@ -65,14 +70,15 @@
             @end
         @end
         @if(o_fog)
-            vFog = aFog;
+            vFogW = aFog * aVtxPos.w;
         @end
         @if(o_grayscale)
             vGrayscaleColor = aGrayscaleColor;
         @end
         @for(i in 0..o_inputs)
-            vInput@{i + 1} = aInput@{i + 1};
+            vInputW@{i + 1} = aInput@{i + 1} * aVtxPos.w;
         @end
+        vShadeW = aVtxPos.w;
         gl_Position = aVtxPos;
     }
 @else
@@ -101,7 +107,7 @@
     @end
 
     @if(o_fog)
-    layout(location = 7) in vec4 vFog;
+    layout(location = 7) in vec4 vFogW;
     @end
     @if(o_grayscale)
     layout(location = 8) in vec4 vGrayscaleColor;
@@ -109,11 +115,12 @@
 
     @for(i in 0..o_inputs)
         @if(o_alpha)
-            layout(location = @{9 + i}) in vec4 vInput@{i + 1};
+            layout(location = @{9 + i}) in vec4 vInputW@{i + 1};
         @else
-            layout(location = @{9 + i}) in vec3 vInput@{i + 1};
+            layout(location = @{9 + i}) in vec3 vInputW@{i + 1};
         @end
     @end
+    layout(location = 0) in float vShadeW;
 
     // Bindings 0-5: texture 0, texture 1, mask 0, mask 1, blend 0, blend 1 (as the other backends' texture units)
     @if(o_textures[0])
@@ -181,6 +188,15 @@
     }
 
     void main() {
+        float shadeInvW = 1.0 / vShadeW;
+        @if(o_fog) vec4 vFog = vFogW * shadeInvW;
+        @for(i in 0..o_inputs)
+            @if(o_alpha)
+                vec4 vInput@{i + 1} = vInputW@{i + 1} * shadeInvW;
+            @else
+                vec3 vInput@{i + 1} = vInputW@{i + 1} * shadeInvW;
+            @end
+        @end
         @for(i in 0..2)
             @if(o_textures[i])
                 @{s = o_clamp[i][0]}

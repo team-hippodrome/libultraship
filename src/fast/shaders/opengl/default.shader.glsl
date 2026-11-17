@@ -27,7 +27,7 @@
 
     @if(o_fog)
         @{attr} vec4 aFog;
-        @{out} vec4 vFog;
+        @{out} vec4 vFogW;
         @{update_floats(4)}
     @end
 
@@ -40,14 +40,18 @@
     @for(i in 0..o_inputs)
         @if(o_alpha)
             @{attr} vec4 aInput@{i + 1};
-            @{out} vec4 vInput@{i + 1};
+            @{out} vec4 vInputW@{i + 1};
             @{update_floats(4)}
         @else
             @{attr} vec3 aInput@{i + 1};
-            @{out} vec3 vInput@{i + 1};
+            @{out} vec3 vInputW@{i + 1};
             @{update_floats(3)}
         @end
     @end
+    // PORT: the RDP interpolates shade (and the fog in it) linearly across the screen; only texture coordinates get
+    // perspective correction. Inputs go out multiplied by w and are divided by the interpolated w in the fragment
+    // shader, which cancels the perspective weighting (and stays right where the GPU clips at the near plane).
+    @{out} float vShadeW;
 
     void main() {
         @for(i in 0..2)
@@ -65,14 +69,15 @@
             @end
         @end
         @if(o_fog)
-            vFog = aFog;
+            vFogW = aFog * aVtxPos.w;
         @end
         @if(o_grayscale)
             vGrayscaleColor = aGrayscaleColor;
         @end
         @for(i in 0..o_inputs)
-            vInput@{i + 1} = aInput@{i + 1};
+            vInputW@{i + 1} = aInput@{i + 1} * aVtxPos.w;
         @end
+        vShadeW = aVtxPos.w;
         gl_Position = aVtxPos;
         @if(opengles)
             gl_Position.z *= 0.3f;
@@ -108,16 +113,17 @@
         @end
     @end
 
-    @if(o_fog) @{attr} vec4 vFog;
+    @if(o_fog) @{attr} vec4 vFogW;
     @if(o_grayscale) @{attr} vec4 vGrayscaleColor;
 
     @for(i in 0..o_inputs)
         @if(o_alpha)
-            @{attr} vec4 vInput@{i + 1};
+            @{attr} vec4 vInputW@{i + 1};
         @else
-            @{attr} vec3 vInput@{i + 1};
+            @{attr} vec3 vInputW@{i + 1};
         @end
     @end
+    @{attr} float vShadeW;
 
     @if(o_textures[0]) uniform sampler2D uTex0;
     @if(o_textures[1]) uniform sampler2D uTex1;
@@ -175,6 +181,15 @@
     #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
 
     void main() {
+        float shadeInvW = 1.0 / vShadeW;
+        @if(o_fog) vec4 vFog = vFogW * shadeInvW;
+        @for(i in 0..o_inputs)
+            @if(o_alpha)
+                vec4 vInput@{i + 1} = vInputW@{i + 1} * shadeInvW;
+            @else
+                vec3 vInput@{i + 1} = vInputW@{i + 1} * shadeInvW;
+            @end
+        @end
         @for(i in 0..2)
             @if(o_textures[i])
                 @{s = o_clamp[i][0]}

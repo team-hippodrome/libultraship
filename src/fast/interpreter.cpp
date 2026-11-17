@@ -2648,6 +2648,87 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
+    // PORT: the RDP interpolates shade linearly across the screen (the shaders undo the GPU's perspective weighting of
+    // the shade inputs), so where the RSP cuts a triangle changes the picture: F3DEX2 clips a triangle that crosses the
+    // near plane or the guard band (clip ratio 2: |x| or |y| beyond 2w) into a polygon whose new vertices take colours
+    // and texture coordinates interpolated in clip space, and the RDP then shades the pieces. Do the same here, so a big
+    // floor triangle that reaches off screen is shaded like the N64 shades it.
+    static const float sClipRatio = getenv("PORT_CLIP_RATIO") ? (float)atof(getenv("PORT_CLIP_RATIO")) : 2.0f;
+    if (!is_rect && !mInRspClip && sClipRatio > 0.0f && !(v1->ortho && v2->ortho && v3->ortho)) {
+        auto dist = [](const LoadedVertex* v, int plane) -> float {
+            switch (plane) {
+                case 0: return v->x + sClipRatio * v->w;
+                case 1: return sClipRatio * v->w - v->x;
+                case 2: return v->y + sClipRatio * v->w;
+                case 3: return sClipRatio * v->w - v->y;
+                default: return v->z + v->w; // near
+            }
+        };
+        uint32_t outMask[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            for (int p = 0; p < 5; p++) {
+                if (dist(v_arr[i], p) < 0.0f) outMask[i] |= 1u << p;
+            }
+        }
+        if ((outMask[0] | outMask[1] | outMask[2]) != 0) {
+            if ((outMask[0] & outMask[1] & outMask[2]) != 0) {
+                return; // wholly outside one plane: the RSP draws nothing
+            }
+            LoadedVertex polyA[16], polyB[16];
+            LoadedVertex* in = polyA;
+            LoadedVertex* out = polyB;
+            int n = 3;
+            for (int i = 0; i < 3; i++) in[i] = *v_arr[i];
+            for (int p = 0; p < 5 && n >= 3; p++) {
+                int m = 0;
+                for (int i = 0; i < n; i++) {
+                    const LoadedVertex& a = in[i];
+                    const LoadedVertex& b = in[(i + 1) % n];
+                    const float da = dist(&a, p), db = dist(&b, p);
+                    if (da >= 0.0f && m < 16) out[m++] = a;
+                    if ((da >= 0.0f) != (db >= 0.0f) && m < 16) {
+                        const float t = da / (da - db);
+                        LoadedVertex c = a;
+                        c.x = a.x + (b.x - a.x) * t;
+                        c.y = a.y + (b.y - a.y) * t;
+                        c.z = a.z + (b.z - a.z) * t;
+                        c.w = a.w + (b.w - a.w) * t;
+                        c.u = a.u + (b.u - a.u) * t;
+                        c.v = a.v + (b.v - a.v) * t;
+                        c.color.r = (uint8_t)lroundf(a.color.r + (b.color.r - a.color.r) * t);
+                        c.color.g = (uint8_t)lroundf(a.color.g + (b.color.g - a.color.g) * t);
+                        c.color.b = (uint8_t)lroundf(a.color.b + (b.color.b - a.color.b) * t);
+                        c.color.a = (uint8_t)lroundf(a.color.a + (b.color.a - a.color.a) * t);
+                        c.x_edge = NAN;
+                        out[m++] = c;
+                    }
+                }
+                std::swap(in, out);
+                n = m;
+            }
+            if (n < 3) {
+                return;
+            }
+            const int base = MAX_VERTICES + 4;
+            for (int i = 0; i < n; i++) {
+                LoadedVertex& d = mRsp->loaded_vertices[base + i];
+                d = in[i];
+                d.clip_rej = 0;
+                if (d.x < -d.w) d.clip_rej |= 1;
+                if (d.x > d.w) d.clip_rej |= 2;
+                if (d.y < -d.w) d.clip_rej |= 4;
+                if (d.y > d.w) d.clip_rej |= 8;
+                if (d.z > d.w) d.clip_rej |= 32;
+            }
+            mInRspClip = true;
+            for (int i = 1; i + 1 < n; i++) {
+                GfxSpTri1(base, base + i, base + i + 1, false);
+            }
+            mInRspClip = false;
+            return;
+        }
+    }
+
     // if (rand()%2) return;
     static int sTot = 0, sClip = 0;
     static bool sLog = getenv("PORT_TRILOG") != nullptr;
