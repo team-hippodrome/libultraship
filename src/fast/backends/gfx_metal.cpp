@@ -624,14 +624,18 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
 
     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
 
-    NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
-
-    MTL::TextureDescriptor* texture_descriptor =
-        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
-    texture_descriptor->setArrayLength(1);
-    texture_descriptor->setMipmapLevelCount(1);
-    texture_descriptor->setSampleCount(1);
-    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    static const bool sNoHeap = getenv("PORT_NO_MTL_HEAP") != nullptr; // debug: every texture from the device
+    if (mUploadDescriptor == nullptr) {
+        // texture2DDescriptor returns an autoreleased object; keep it, only the size changes between uploads
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        mUploadDescriptor = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, 1, 1, true);
+        mUploadDescriptor->retain();
+        mUploadDescriptor->setArrayLength(1);
+        mUploadDescriptor->setMipmapLevelCount(1);
+        mUploadDescriptor->setSampleCount(1);
+        mUploadDescriptor->setStorageMode(MTL::StorageModeShared);
+        pool->release();
+    }
 
     MTL::Region region = MTL::Region::Make2D(0, 0, width, height);
 
@@ -641,15 +645,43 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
         if (texture_data->texture != nullptr)
             texture_data->texture->release();
 
-        texture = mDevice->newTexture(texture_descriptor);
+        mUploadDescriptor->setWidth(width);
+        mUploadDescriptor->setHeight(height);
+        texture = nullptr;
+        // PORT: a scene change makes ~300 small textures in one frame (16x16 JPEG background tiles), and nearly all the
+        // upload time was MTLDevice newTexture, a resource of its own each (median 2.6 us, mean 4.6 us, p99 30 us in
+        // the cup_giveup replay; from a heap 1.3 / 2.2 / 14 us). Textures too big to be worth sharing a heap
+        // (framebuffer copies, HD textures) go to the device. The CPU writes these (replaceRegion) and the GPU only
+        // reads them, so the heaps and their textures need no hazard tracking, which would only add per-draw work.
+        constexpr uint64_t kHeapMaxTexture = 256 * 1024, kHeapSize = 16 * 1024 * 1024;
+        if (!sNoHeap && (uint64_t)width * height * 4 <= kHeapMaxTexture) {
+            mUploadDescriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked); // the heaps' mode
+            for (auto it = mTextureHeaps.rbegin(); it != mTextureHeaps.rend() && texture == nullptr; ++it) {
+                texture = (*it)->newTexture(mUploadDescriptor);
+            }
+            if (texture == nullptr) {
+                MTL::HeapDescriptor* heap_descriptor = MTL::HeapDescriptor::alloc()->init();
+                heap_descriptor->setSize(kHeapSize);
+                heap_descriptor->setStorageMode(MTL::StorageModeShared);
+                heap_descriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
+                MTL::Heap* heap = mDevice->newHeap(heap_descriptor);
+                heap_descriptor->release();
+                if (heap != nullptr) {
+                    mTextureHeaps.push_back(heap);
+                    texture = heap->newTexture(mUploadDescriptor);
+                }
+            }
+        }
+        if (texture == nullptr) {
+            mUploadDescriptor->setHazardTrackingMode(MTL::HazardTrackingModeDefault);
+            texture = mDevice->newTexture(mUploadDescriptor);
+        }
     }
 
     NS::UInteger bytes_per_pixel = 4;
     NS::UInteger bytes_per_row = bytes_per_pixel * width;
     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
     texture_data->texture = texture;
-
-    autorelease_pool->release();
 }
 
 void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
@@ -657,17 +689,24 @@ void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, ui
     texture_data->linear_filtering = linear_filter;
     texture_data->filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
 
-    // This function is called twice per texture, the first one only to set default values.
-    // Maybe that could be skipped? Anyway, make sure to release the first default sampler
-    // state before setting the actual one.
-    if (texture_data->sampler != nullptr) {
+    // PORT: samplers are immutable and there are only 2 filters x 4 x 4 address modes: share them. A texture used to
+    // get a fresh MTLSamplerState here (twice per texture, once for the default and once for the draw's): 0.5 us
+    // against 0.05 us a call, 600 calls in a scene change.
+    static const bool sNoSamplerCache = getenv("PORT_NO_MTL_SAMPLER_CACHE") != nullptr;
+    const bool filter_linear = linear_filter && mCurrentFilterMode == FILTER_LINEAR;
+    const uint32_t cache_index = (filter_linear ? 16 : 0) + (cms & 3) * 4 + (cmt & 3);
+    if (!sNoSamplerCache && mSamplerCache[cache_index] != nullptr) {
+        texture_data->sampler = mSamplerCache[cache_index];
+        return;
+    }
+
+    // (This function is called twice per texture, the first one only to set default values.)
+    if (sNoSamplerCache && texture_data->sampler != nullptr) {
         texture_data->sampler->release();
     }
 
     MTL::SamplerDescriptor* sampler_descriptor = MTL::SamplerDescriptor::alloc()->init();
-    MTL::SamplerMinMagFilter filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR
-                                          ? MTL::SamplerMinMagFilterLinear
-                                          : MTL::SamplerMinMagFilterNearest;
+    MTL::SamplerMinMagFilter filter = filter_linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
     sampler_descriptor->setMinFilter(filter);
     sampler_descriptor->setMagFilter(filter);
     sampler_descriptor->setSAddressMode(gfx_cm_to_metal(cms));
@@ -675,6 +714,9 @@ void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, ui
     sampler_descriptor->setRAddressMode(MTL::SamplerAddressModeRepeat);
 
     texture_data->sampler = mDevice->newSamplerState(sampler_descriptor);
+    if (!sNoSamplerCache) {
+        mSamplerCache[cache_index] = texture_data->sampler;
+    }
     sampler_descriptor->release();
 }
 
@@ -1124,6 +1166,33 @@ static bool DrawOldPictureScaled(MTL::Device* device, MTL::CommandQueue* queue, 
     return true;
 }
 
+MTL::Texture* GfxRenderingAPIMetal::AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level) {
+    // textures of sizes no target has any more (window resized) are given back first
+    for (auto it = mSharedMsaaDepth.begin(); it != mSharedMsaaDepth.end();) {
+        if (it->second->retainCount() == 1) {
+            it->second->release();
+            it = mSharedMsaaDepth.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const auto key = std::make_tuple(width, height, msaa_level);
+    auto it = mSharedMsaaDepth.find(key);
+    if (it == mSharedMsaaDepth.end()) {
+        MTL::TextureDescriptor* desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatDepth32Float, width, height, true);
+        desc->setTextureType(MTL::TextureType2DMultisample);
+        desc->setStorageMode(MTL::StorageModePrivate);
+        desc->setSampleCount(msaa_level);
+        desc->setArrayLength(1);
+        desc->setMipmapLevelCount(1);
+        desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        it = mSharedMsaaDepth.emplace(key, mDevice->newTexture(desc)).first;
+    }
+    it->second->retain(); // (the caller's reference)
+    return it->second;
+}
+
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                        bool can_extract_depth) {
@@ -1181,6 +1250,10 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             if (tex.msaaTexture != nullptr)
                 tex.msaaTexture->release();
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
+        } else if (tex.msaaTexture != nullptr) {
+            // (a target that is no longer multisampled gives the multisampled texture back)
+            tex.msaaTexture->release();
+            tex.msaaTexture = nullptr;
         }
 
         bool kept = old_texture != nullptr && DrawOldPictureScaled(mDevice, mCommandQueue, old_texture, tex.texture,
@@ -1242,13 +1315,13 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
         fb.mDepthTexture = mDevice->newTexture(depth_tex_desc);
 
         if (msaa_level > 1) {
-            depth_tex_desc->setTextureType(MTL::TextureType2DMultisample);
-            depth_tex_desc->setSampleCount(msaa_level);
-
             if (fb.mMsaaDepthTexture != nullptr)
                 fb.mMsaaDepthTexture->release();
 
-            fb.mMsaaDepthTexture = mDevice->newTexture(depth_tex_desc);
+            fb.mMsaaDepthTexture = AcquireMsaaDepth(width, height, msaa_level);
+        } else if (fb.mMsaaDepthTexture != nullptr) {
+            fb.mMsaaDepthTexture->release();
+            fb.mMsaaDepthTexture = nullptr;
         }
     }
 

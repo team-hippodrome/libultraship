@@ -456,8 +456,19 @@ static int sAnchor = 0;
 // PORT: frame interpolation of frames that draw over the previous picture (Interpreter::ReplayBegin): a copy of each game
 // frame buffer's picture from before the frame, and the buffers already copied away/back in this drawing
 static bool sReplayRestore = false;
-static std::unordered_map<uintptr_t, std::pair<int, uint32_t>> sSnapFbs; // framebuffer, its MSAA level
+// A copy only lives from a game frame's first drawing to its last repeat, and the frames are drawn one after the other:
+// the copies are a small pool of full size targets (one per buffer the series copies), not one per buffer address.
+struct SnapFb {
+    int fb = 0;
+    uint32_t msaa = 0;   // MSAA level it is sized for (0: not sized, 1x1)
+    uint64_t used = 0;   // host frame of its last copy
+};
+static std::vector<SnapFb> sSnapPool;
+static std::unordered_map<uintptr_t, size_t> sSnapSeries; // buffer address -> pool index, for the current series
 static std::unordered_set<uintptr_t> sSnapDoneThisRun;
+static uint64_t sHostFrameNo = 0;
+// a copy unused for this many host frames gives its (full size, multisampled) textures back until it is needed again
+static constexpr uint64_t kSnapIdleFrames = 90;
 // PORT: 2D in-between frames (Interpreter::mReplayT): the rectangles of the last exact drawing by key, in drawing order
 struct Interp2DKey {
     const void* tex;
@@ -569,18 +580,27 @@ Interpreter::Interpreter() {
     mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 }
 
+static std::weak_ptr<Interpreter> mInstance;
+// PORT: raw alias of mInstance for per-command hot paths. weak_ptr::lock() costs two atomic refcount ops per call.
+// Valid whenever mInstance is unexpired: set in GfxSetInstance, cleared in ~Interpreter (the owner outlives every
+// display-list handler call, which all run from within Interpreter::Run).
+static Interpreter* sInstance = nullptr;
+
 Interpreter::~Interpreter() {
+    if (sInstance == this) {
+        sInstance = nullptr;
+    }
     delete mRsp;
     delete mRdp;
     delete[] mBufVbo;
 }
 
-static std::weak_ptr<Interpreter> mInstance;
 // Cached for free-function callbacks that cannot capture context (plain function pointers).
 static std::shared_ptr<Ship::ResourceManager> sResourceManager;
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
+    sInstance = gfx.get();
 }
 
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
@@ -4632,16 +4652,24 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
             const bool window = ViewportMatchesRendererResolution();
             const uint32_t w = window ? mGfxCurrentWindowDimensions.width : mCurDimensions.width;
             const uint32_t h = window ? mGfxCurrentWindowDimensions.height : mCurDimensions.height;
-            auto& entry = sSnapFbs[(uintptr_t)address];
-            if (entry.first == 0) {
-                entry.first = mRapi->CreateFramebuffer();
+            auto series = sSnapSeries.find((uintptr_t)address);
+            if (series == sSnapSeries.end()) {
+                series = sSnapSeries.emplace((uintptr_t)address, sSnapSeries.size()).first;
             }
-            if (entry.second != mMsaaLevel) {
-                entry.second = mMsaaLevel;
-                mRapi->UpdateFramebufferParameters(entry.first, w, h, mMsaaLevel, window ? mMsaaLevel <= 1 : true, true,
-                                                   true, true);
+            if (series->second >= sSnapPool.size()) {
+                sSnapPool.resize(series->second + 1);
             }
-            const int snap = entry.first;
+            SnapFb& entry = sSnapPool[series->second];
+            entry.used = sHostFrameNo;
+            if (entry.fb == 0) {
+                entry.fb = mRapi->CreateFramebuffer();
+            }
+            if (entry.msaa != mMsaaLevel) {
+                entry.msaa = mMsaaLevel;
+                mRapi->UpdateFramebufferParameters(entry.fb, w, h, mMsaaLevel, window ? mMsaaLevel <= 1 : true, true,
+                                                   false, false);
+            }
+            const int snap = entry.fb;
             Flush();
             if (!mReplayPass) {
                 mRapi->CopyFramebufferInStream(fb, snap, fb, (int)w, (int)h);
@@ -4934,7 +4962,7 @@ void gfx_copy_framebuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* has
 typedef bool (*GfxOpcodeHandlerFunc)(F3DGfx** gfx);
 
 bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     gfx->mRsp->fog_mul = 0;
     gfx->mRsp->fog_offset = 0;
     return false;
@@ -4946,7 +4974,7 @@ bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
 }
 
 bool gfx_marker_handler_otr(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     (*cmd0)++;
     F3DGfx* cmd = (*cmd0);
     gfx->mMarkerOn = true;
@@ -4954,7 +4982,7 @@ bool gfx_marker_handler_otr(F3DGfx** cmd0) {
 }
 
 bool gfx_invalidate_tex_cache_handler_f3dex2(F3DGfx** cmd) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     const uintptr_t texAddr = (*cmd)->words.w1;
 
     if (texAddr == 0) {
@@ -4985,7 +5013,7 @@ bool gfx_noop_handler_f3dex2(F3DGfx** cmd0) {
     }
     if (p == 0x53) { // PORT: gDPPort3DScene: the main picture is a 3D scene's, not a 2D screen (s2DRectArea)
         static const bool sOff = getenv("PORT_NO_3D_SCENE_MARK") != nullptr;
-        Interpreter* gfx = mInstance.lock().get();
+        Interpreter* gfx = sInstance;
         if (l != 0 && !sOff && gfx != nullptr && !gfx->mFbActive) {
             sSeen3DThisRun = true;
         }
@@ -5007,7 +5035,7 @@ extern "C" uintptr_t Port_DlBufferBase(void) __attribute__((weak));
 extern "C" void Port_DlBufferWhere(uintptr_t p, int* which, long* off) __attribute__((weak));
 extern "C" int Port_DlBufferActive(void) __attribute__((weak));
 bool gfx_mtx_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     uintptr_t mtxAddr = cmd->words.w1;
     if (gPortDrawLog) { // PORT debug: a matrix address that holds display-list commands
@@ -5027,7 +5055,7 @@ bool gfx_mtx_handler_f3dex2(F3DGfx** cmd0) {
 }
 // Seems to be the same for all other non F3DEX2 microcodes...
 bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     uintptr_t mtxAddr = cmd->words.w1;
 
@@ -5036,7 +5064,7 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     const char* fileName = (const char*)cmd->words.w1;
     const int32_t* mtx = (const int32_t*)sResourceManager->GetResourceRawPointer((const char*)fileName);
@@ -5049,7 +5077,7 @@ bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_mtx_otr_filepath_handler_custom_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     const char* fileName = (const char*)cmd->words.w1;
     const int32_t* mtx = (const int32_t*)sResourceManager->GetResourceRawPointer((const char*)fileName);
@@ -5077,7 +5105,7 @@ bool gfx_mtx_otr_handler_custom_f3dex2(F3DGfx** cmd0) {
     const int32_t* mtx = (const int32_t*)sResourceManager->GetResourceRawPointer(hash);
 
     if (mtx != NULL) {
-        Interpreter* gfx = mInstance.lock().get();
+        Interpreter* gfx = sInstance;
         cmd--;
         gfx->GfxSpMatrix(C0(0, 8) ^ F3DEX2_G_MTX_PUSH, mtx);
         cmd++;
@@ -5087,7 +5115,7 @@ bool gfx_mtx_otr_handler_custom_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_mtx_otr_handler_custom_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     (*cmd0)++;
     F3DGfx* cmd = *cmd0;
 
@@ -5110,7 +5138,7 @@ bool gfx_mtx_otr_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_pop_mtx_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpPopMatrix((uint32_t)(cmd->words.w1 / 64));
@@ -5119,7 +5147,7 @@ bool gfx_pop_mtx_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_pop_mtx_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpPopMatrix(1);
@@ -5128,7 +5156,7 @@ bool gfx_pop_mtx_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_movemem_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpMovememF3dex2(C0(0, 8), C0(8, 8) * 8, gfx->SegAddr(cmd->words.w1));
@@ -5137,7 +5165,7 @@ bool gfx_movemem_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_movemem_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpMovememF3d(C0(16, 8), 0, gfx->SegAddr(cmd->words.w1));
@@ -5146,7 +5174,7 @@ bool gfx_movemem_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     const uint8_t index = C1(24, 8);
@@ -5168,7 +5196,7 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
 }
 
 bool gfx_push_shader(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     const char* path = (const char*)gfx->SegAddr(cmd->words.w1);
 
@@ -5198,7 +5226,7 @@ bool gfx_push_shader(F3DGfx** cmd0) {
 }
 
 bool gfx_pop_shader(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->mShaderStack.pop();
@@ -5207,7 +5235,7 @@ bool gfx_pop_shader(F3DGfx** cmd0) {
 }
 
 const char* gfx_get_shader(int16_t id) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
 
     for (const std::pair<size_t, const char*>& shader : gfx->mShaders) {
         if (shader.first == id) {
@@ -5219,7 +5247,7 @@ const char* gfx_get_shader(int16_t id) {
 }
 
 bool gfx_moveword_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpMovewordF3dex2(C0(16, 8), C0(0, 16), cmd->words.w1);
@@ -5228,7 +5256,7 @@ bool gfx_moveword_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_moveword_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpMovewordF3d(C0(0, 8), C0(8, 16), cmd->words.w1);
@@ -5237,7 +5265,7 @@ bool gfx_moveword_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_texture_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTexture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(1, 7));
@@ -5247,7 +5275,7 @@ bool gfx_texture_handler_f3dex2(F3DGfx** cmd0) {
 
 // Seems to be the same for all other non F3DEX2 microcodes...
 bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTexture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(0, 8));
@@ -5257,7 +5285,7 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
 
 // Almost all versions of the microcode have their own version of this opcode
 bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     const F3DVtx* vtx = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
@@ -5279,7 +5307,7 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
 
@@ -5287,7 +5315,7 @@ bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
 }
 
 bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
@@ -5296,7 +5324,7 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     // Offset added to the start of the vertices
     const uintptr_t offset = (*cmd0)->words.w1;
     // This is a two-part display list command, so increment the instruction pointer so we can get the CRC64
@@ -5331,7 +5359,7 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
     (*cmd0)++;
@@ -5370,7 +5398,7 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
 
 // The original F3D microcode doesn't seem to have this opcode. Glide handles it as part of moveword
 bool gfx_modify_vtx_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     gfx->GfxSpModifyVertex(C0(1, 15), C0(16, 8), (uint32_t)cmd->words.w1);
     return false;
@@ -5382,7 +5410,7 @@ static struct { const void* from; uintptr_t w1; const void* to; } sDlTrail[16];
 static unsigned sDlTrailPos;
 
 bool gfx_dl_handler_common(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
     sDlTrail[sDlTrailPos++ & 15] = { cmd, (uintptr_t)cmd->words.w1, subGFX };
@@ -5418,7 +5446,7 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
             g_exec_stack.call(cmd, gfx);
         }
     } else {
-        Interpreter* gfx = mInstance.lock().get();
+        Interpreter* gfx = sInstance;
         assert(0 && "????");
         (*cmd0) = (F3DGfx*)gfx->SegAddr((*cmd0)->words.w1);
         return true;
@@ -5429,7 +5457,7 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
     // Compute seg addr by converting an index value to an offset value
     // handling 32 vs 64 bit size differences for Gfx
     // adding 1 to trigger the segaddr flow
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = (*cmd0);
     uint8_t segNum = (uint8_t)(cmd->words.w1 >> 24);
     uint32_t index = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
@@ -5458,7 +5486,7 @@ bool gfx_pushcd_handler_custom(F3DGfx** cmd0) {
 // TODO handle special OTR opcodes later...
 bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
     // Push return address
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = (*cmd0);
 
     uint8_t vbidx = (uint8_t)((*cmd0)->words.w0 & 0x00000FFF);
@@ -5483,14 +5511,14 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
 
 // F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
 bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     gfx->mMarkerOn = false;
     g_exec_stack.ret();
     return true;
 }
 
 bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     uint32_t w1 = (*cmd)->words.w1;
     gfx->mRdp->prim_depth = (uint16_t)((w1 >> 16) & 0x7FFF); // Mask to 15 bits
     return false;
@@ -5498,7 +5526,7 @@ bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
 
 // Only on F3DEX2
 bool gfx_geometry_mode_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpGeometryMode(~C0(0, 24), (uint32_t)cmd->words.w1);
@@ -5507,7 +5535,7 @@ bool gfx_geometry_mode_handler_f3dex2(F3DGfx** cmd0) {
 
 // Only on F3DEX and older
 bool gfx_set_geometry_mode_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpGeometryMode(0, (uint32_t)cmd->words.w1);
@@ -5516,7 +5544,7 @@ bool gfx_set_geometry_mode_handler_f3d(F3DGfx** cmd0) {
 
 // Only on F3DEX and older
 bool gfx_clear_geometry_mode_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpGeometryMode((uint32_t)cmd->words.w1, 0);
@@ -5524,7 +5552,7 @@ bool gfx_clear_geometry_mode_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_tri1_otr_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
 
     F3DGfx* cmd = *cmd0;
     uint8_t v00 = (uint8_t)(cmd->words.w0 & 0x0000FFFF);
@@ -5536,7 +5564,7 @@ bool gfx_tri1_otr_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_tri1_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2, false);
@@ -5545,7 +5573,7 @@ bool gfx_tri1_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_tri1_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C1(17, 7), C1(9, 7), C1(1, 7), false);
@@ -5554,7 +5582,7 @@ bool gfx_tri1_handler_f3dex(F3DGfx** cmd0) {
 }
 
 bool gfx_tri1_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C1(16, 8) / 10, C1(8, 8) / 10, C1(0, 8) / 10, false);
@@ -5564,7 +5592,7 @@ bool gfx_tri1_handler_f3d(F3DGfx** cmd0) {
 
 // F3DEX, and F3DEX2 share a tri2 function, however F3DEX has a different quad function.
 bool gfx_tri2_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C0(17, 7), C0(9, 7), C0(1, 7), false);
@@ -5573,7 +5601,7 @@ bool gfx_tri2_handler_f3dex(F3DGfx** cmd0) {
 }
 
 bool gfx_quad_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2, false);
@@ -5582,7 +5610,7 @@ bool gfx_quad_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_quad_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpTri1(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2, false);
@@ -5591,7 +5619,7 @@ bool gfx_quad_handler_f3dex(F3DGfx** cmd0) {
 }
 
 bool gfx_othermode_l_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpSetOtherMode(31 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, cmd->words.w1);
@@ -5600,7 +5628,7 @@ bool gfx_othermode_l_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 bool gfx_othermode_l_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpSetOtherMode(C0(8, 8), C0(0, 8), cmd->words.w1);
@@ -5609,7 +5637,7 @@ bool gfx_othermode_l_handler_f3d(F3DGfx** cmd0) {
 }
 
 bool gfx_othermode_h_handler_f3dex2(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpSetOtherMode(63 - C0(8, 8) - C0(0, 8), C0(0, 8) + 1, (uint64_t)cmd->words.w1 << 32);
@@ -5619,7 +5647,7 @@ bool gfx_othermode_h_handler_f3dex2(F3DGfx** cmd0) {
 
 // Only on F3DEX and older
 bool gfx_set_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpGeometryMode(0, (uint32_t)cmd->words.w1);
@@ -5628,7 +5656,7 @@ bool gfx_set_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
 
 // Only on F3DEX and older
 bool gfx_clear_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpGeometryMode((uint32_t)cmd->words.w1, 0);
@@ -5636,7 +5664,7 @@ bool gfx_clear_geometry_mode_handler_f3dex(F3DGfx** cmd0) {
 }
 
 bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxSpSetOtherMode(C0(8, 8) + 32, C0(0, 8), (uint64_t)cmd->words.w1 << 32);
@@ -5666,7 +5694,7 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
 }
 
 bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     uintptr_t i = (uintptr_t)gfx->SegAddr(cmd->words.w1);
     sLastTimgCmd = cmd;
@@ -5823,7 +5851,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         uint32_t width = C0(0, 12) + 1;
 
         if (tex != NULL) {
-            Interpreter* gfx = mInstance.lock().get();
+            Interpreter* gfx = sInstance;
             gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata, tex);
         }
     } else {
@@ -5844,7 +5872,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     std::shared_ptr<Fast::Texture> texture =
         std::static_pointer_cast<Fast::Texture>(sResourceManager->LoadResourceProcess(fileName));
     if (texture != nullptr) {
-        Interpreter* gfx = mInstance.lock().get();
+        Interpreter* gfx = sInstance;
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
         rawTexMetadata.height = texture->Height;
@@ -5867,7 +5895,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
 
 bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     gfx->Flush();
 
     if (cmd->words.w1) {
@@ -5883,7 +5911,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
@@ -5898,7 +5926,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     bool* hasCopiedPtr = (bool*)cmd->words.w1;
 
@@ -5908,7 +5936,7 @@ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     int32_t width, height;
@@ -5940,7 +5968,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
@@ -5971,7 +5999,7 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->Flush();
@@ -5982,7 +6010,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->grayscale = cmd->words.w1;
@@ -5990,7 +6018,7 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpLoadBlock(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
@@ -5998,7 +6026,7 @@ bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_load_block_wide_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     uint32_t tile = cmd->words.w0 & 0x7;
@@ -6016,7 +6044,7 @@ bool gfx_load_block_wide_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_load_tile_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpLoadTile(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
@@ -6024,7 +6052,7 @@ bool gfx_load_tile_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_tile_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetTile(C0(21, 3), C0(19, 2), C0(9, 9), C0(0, 9), C1(24, 3), C1(20, 4), C1(18, 2), C1(14, 4), C1(10, 4),
@@ -6033,7 +6061,7 @@ bool gfx_set_tile_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_tile_size_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetTileSize(C1(24, 3), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
@@ -6042,7 +6070,7 @@ bool gfx_set_tile_size_handler_rdp(F3DGfx** cmd0) {
 
 bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
 
     if (gfx->mInterpolationIndex == gfx->mInterpolationIndexTarget) {
         int tile = C1(24, 3);
@@ -6063,7 +6091,7 @@ bool gfx_set_tile_size_interp_handler_rdp(F3DGfx** cmd0) {
 
 bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
 
     int tile = C1(24, 3);
     float coords[8];
@@ -6086,14 +6114,14 @@ bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
 
 bool gfx_set_interpolation_index_target(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
 
     gfx->mInterpolationIndexTarget = cmd->words.w1;
     return false;
 }
 
 bool gfx_load_tlut_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpLoadTlut(C1(24, 3), C1(14, 10));
@@ -6101,7 +6129,7 @@ bool gfx_load_tlut_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_env_color_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetEnvColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
@@ -6109,7 +6137,7 @@ bool gfx_set_env_color_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_prim_color_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetPrimColor(C0(8, 8), C0(0, 8), C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
@@ -6117,7 +6145,7 @@ bool gfx_set_prim_color_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_fog_color_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetFogColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
@@ -6130,7 +6158,7 @@ bool gfx_set_fog_color_handler_rdp(F3DGfx** cmd0) {
 // applied during texture sampling.
 // G_SETKEYR: w1 = [wR:12 | cR:8 | sR:8]
 bool gfx_set_key_r_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->key_center.r = C1(8, 8);
@@ -6140,7 +6168,7 @@ bool gfx_set_key_r_handler_rdp(F3DGfx** cmd0) {
 
 // G_SETKEYGB: w0 = [op:8 | wG:12 | _:4 | wB:12], w1 = [cG:8 | sG:8 | cB:8 | sB:8]
 bool gfx_set_key_gb_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->key_center.g = C1(24, 8);
@@ -6153,7 +6181,7 @@ bool gfx_set_key_gb_handler_rdp(F3DGfx** cmd0) {
 // G_SETCONVERT: w0 = [op:8 | k0:9 | k1:9 | k2_hi:4], w1 = [k2_lo:5 | k3:9 | k4:9 | k5:9]
 // K0..K5 are signed 9-bit values; sign-extend after decoding.
 bool gfx_set_convert_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->convert_k[0] = sign_extend_9(C0(13, 9));
@@ -6167,7 +6195,7 @@ bool gfx_set_convert_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_blend_color_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetBlendColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
@@ -6175,7 +6203,7 @@ bool gfx_set_blend_color_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_fill_color_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetFillColor((uint32_t)cmd->words.w1);
@@ -6183,7 +6211,7 @@ bool gfx_set_fill_color_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetGrayscaleColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
@@ -6191,7 +6219,7 @@ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
 
     gfx->GfxDpSetCombineMode(
@@ -6201,7 +6229,7 @@ bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_tex_rect_and_flip_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
     int32_t lrx, lry, tile, ulx, uly;
@@ -6227,7 +6255,7 @@ bool gfx_tex_rect_and_flip_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_tex_rect_wide_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
     int32_t lrx, lry, tile, ulx, uly;
@@ -6251,7 +6279,7 @@ bool gfx_tex_rect_wide_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_image_rect_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *cmd0;
     int16_t tile, iw, ih;
     int16_t x0, y0, s0, t0;
@@ -6275,7 +6303,7 @@ bool gfx_image_rect_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_fill_rect_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxDpFillRectangle(C1(12, 12), C1(0, 12), C0(12, 12), C0(0, 12));
@@ -6283,7 +6311,7 @@ bool gfx_fill_rect_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_fill_wide_rect_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
     int32_t lrx, lry, ulx, uly;
 
@@ -6298,7 +6326,7 @@ bool gfx_fill_wide_rect_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_SetScissor_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxDpSetScissor(C1(24, 2), C0(12, 12), C0(0, 12), C1(12, 12), C1(0, 12));
@@ -6306,7 +6334,7 @@ bool gfx_SetScissor_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1));
@@ -6314,7 +6342,7 @@ bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1));
@@ -6322,7 +6350,7 @@ bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_rdp_set_other_mode_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxDpSetOtherMode(C0(0, 24), (uint32_t)cmd->words.w1);
@@ -6330,7 +6358,7 @@ bool gfx_rdp_set_other_mode_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_bg_copy_handler_s2dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     if (!gfx->mMarkerOn) {
@@ -6340,7 +6368,7 @@ bool gfx_bg_copy_handler_s2dex(F3DGfx** cmd0) {
 }
 
 bool gfx_bg_1cyc_handler_s2dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->Gfxs2dexBg1cyc((F3DuObjBg*)cmd->words.w1);
@@ -6348,7 +6376,7 @@ bool gfx_bg_1cyc_handler_s2dex(F3DGfx** cmd0) {
 }
 
 bool gfx_obj_rectangle_handler_s2dex(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     if (!gfx->mMarkerOn) {
@@ -6358,7 +6386,7 @@ bool gfx_obj_rectangle_handler_s2dex(F3DGfx** cmd0) {
 }
 
 bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     F3DGfx* cmd = *(cmd0);
 
     gfx->GfxSpExtraGeometryMode(~C0(0, 24), (uint32_t)cmd->words.w1);
@@ -6588,7 +6616,7 @@ const char* GfxGetOpcodeName(int8_t opcode) {
 static void gfx_set_ucode_handler(UcodeHandlers ucode) {
     // Loaded ucode must be in range of the supported ucode_handlers
     assert(ucode < ucode_max);
-    Interpreter* gfx = mInstance.lock().get();
+    Interpreter* gfx = sInstance;
     ucode_handler_index = ucode;
 
     // Reset some RSP state values upon ucode load to deal with hardware quirks discovered by emulators
@@ -6809,6 +6837,7 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 }
 
 void Interpreter::StartFrame() {
+    sHostFrameNo++;
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
@@ -6847,21 +6876,32 @@ void Interpreter::StartFrame() {
                 fbs.push_back(e.second);
             }
         }
-        for (auto& e : sSnapFbs) { // (frame interpolation's copies of them)
-            fbs.push_back(e.second.first);
-            e.second.second = mMsaaLevel;
+        const size_t mainCount = fbs.size();
+        // frame interpolation's copies of them only ever hold a picture: no depth buffer
+        for (auto& e : sSnapPool) {
+            if (e.msaa != 0 && sHostFrameNo - e.used > kSnapIdleFrames) {
+                mRapi->UpdateFramebufferParameters(e.fb, 1, 1, 1, true, true, false, false);
+                e.msaa = 0; // (sized again by the next drawing that copies the picture away)
+            }
+            if (e.msaa == 0) {
+                continue;
+            }
+            fbs.push_back(e.fb);
+            e.msaa = mMsaaLevel;
         }
-        for (int fb : fbs) {
+        for (size_t i = 0; i < fbs.size(); i++) {
+            const int fb = fbs[i];
+            const bool depth = i < mainCount;
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->UpdateFramebufferParameters(fb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
-                                                   true, true, true);
+                                                   true, depth, depth);
             } else {
                 // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
                 // match the window size
                 // PORT: Y-inverted when shown as a texture (see above): only an MSAA resolve goes into the window
                 mRapi->UpdateFramebufferParameters(fb, mGfxCurrentWindowDimensions.width,
                                                    mGfxCurrentWindowDimensions.height, mMsaaLevel, mMsaaLevel <= 1, true,
-                                                   true, true);
+                                                   depth, depth);
             }
         }
         if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
@@ -7259,6 +7299,7 @@ bool Interpreter::CanRestorePicture() const {
 
 void Interpreter::ReplayBegin(bool restorePicture) {
     sReplayRestore = restorePicture;
+    sSnapSeries.clear(); // (a new game frame: its copies are taken anew)
     if (sReplay == nullptr) sReplay = new ReplayState();
     ReplayState& r = *sReplay;
     r.rspStart = *mRsp;
@@ -7832,26 +7873,26 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
 
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize, bool forceFixedAspect) {
-    return Fast::mInstance.lock().get()->CreateFrameBuffer(width, height, native_width, native_height, resize,
+    return Fast::sInstance->CreateFrameBuffer(width, height, native_width, native_height, resize,
                                                            forceFixedAspect);
 }
 
 extern "C" void gfx_texture_cache_clear() {
-    Fast::mInstance.lock().get()->TextureCacheClear();
+    Fast::sInstance->TextureCacheClear();
 }
 
 extern "C" void gfx_shader_cache_clear() {
-    auto instance = Fast::mInstance.lock().get();
+    auto instance = Fast::sInstance;
     instance->mColorCombinerPool.clear();
-    instance->mPrevCombiner = Fast::mInstance.lock().get()->mColorCombinerPool.end();
+    instance->mPrevCombiner = Fast::sInstance->mColorCombinerPool.end();
     instance->mRenderingState.mShaderProgram = nullptr;
     instance->mRapi->ClearShaderCache();
 }
 
 extern "C" void gfx_register_fb_texture(const void* cpuAddr, int fbId) {
-    Fast::mInstance.lock().get()->RegisterFbTexture(cpuAddr, fbId);
+    Fast::sInstance->RegisterFbTexture(cpuAddr, fbId);
 }
 
 extern "C" void gfx_unregister_fb_texture(const void* cpuAddr) {
-    Fast::mInstance.lock().get()->UnregisterFbTexture(cpuAddr);
+    Fast::sInstance->UnregisterFbTexture(cpuAddr);
 }

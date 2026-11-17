@@ -999,6 +999,33 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
 // it to black, as an untouched N64 frame buffer would read (see gfx_metal.cpp)
 static std::unordered_set<int> sFreshColorFbs;
 
+GLuint GfxRenderingAPIOGL::AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level) {
+    // renderbuffers of sizes no framebuffer has any more (window resized) are given back first
+    for (auto it = mSharedMsaaDepth.begin(); it != mSharedMsaaDepth.end();) {
+        bool used = false;
+        for (const auto& f : mFrameBuffers) {
+            used = used || f.attachedDepth == it->second;
+        }
+        if (!used) {
+            glDeleteRenderbuffers(1, &it->second);
+            it = mSharedMsaaDepth.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    const auto key = std::make_tuple(width, height, msaa_level);
+    auto it = mSharedMsaaDepth.find(key);
+    if (it == mSharedMsaaDepth.end()) {
+        GLuint rb = 0;
+        glGenRenderbuffers(1, &rb);
+        glBindRenderbuffer(GL_RENDERBUFFER, rb);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        it = mSharedMsaaDepth.emplace(key, rb).first;
+    }
+    return it->second;
+}
+
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                      bool can_extract_depth) {
@@ -1025,6 +1052,12 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     if (fb_id != 0) {
         if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
             if (msaa_level <= 1) {
+                if (fb.msaa_level > 1) {
+                    // (no longer multisampled: the multisampled colour buffer is given back)
+                    glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
+                    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 1, 1);
+                    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                }
                 if (render_target && PortResizeKeepEnabled() && fb.msaa_level <= 1 && ow > 1 && oh > 1 &&
                     (fb.width != width || fb.height != height)) {
                     // blits and clears obey the scissor test (the game's last scissor): off meanwhile, then as it was
@@ -1059,21 +1092,34 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
             }
         }
 
-        if (has_depth_buffer &&
-            (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || !fb.has_depth_buffer)) {
-            glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
-            if (msaa_level <= 1) {
-                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
-            } else {
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
+        GLuint wantDepth = 0;
+        if (has_depth_buffer) {
+            wantDepth = fb.rbo;
+            if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || !fb.has_depth_buffer) {
+                if (msaa_level <= 1) {
+                    glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
+                    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+                    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                } else {
+                    // (the multisampled one is shared: this framebuffer's own gives its memory back)
+                    glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
+                    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
+                    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                    fb.attachedDepth = 0; // (it is counted as using the shared one below)
+                }
             }
+            if (msaa_level > 1) {
+                wantDepth = AcquireMsaaDepth(width, height, msaa_level);
+            }
+        } else if (fb.has_depth_buffer && fb.attachedDepth == fb.rbo) {
+            glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
         }
 
-        if (!fb.has_depth_buffer && has_depth_buffer) {
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fb.rbo);
-        } else if (fb.has_depth_buffer && !has_depth_buffer) {
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+        if (fb.attachedDepth != wantDepth) {
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, wantDepth);
+            fb.attachedDepth = wantDepth;
         }
     }
 

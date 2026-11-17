@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -49,6 +50,8 @@ class RenderPipelineDescriptor;
 class ComputePipelineState;
 class CommandQueue;
 class Viewport;
+class Heap;
+class TextureDescriptor;
 } // namespace MTL
 
 namespace CA {
@@ -284,7 +287,16 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::chrono::steady_clock::time_point mPrebuildStart;
 
     std::vector<struct TextureDataMetal> mTextures;
+    // PORT: a scene change uploads ~300 small textures in one frame, nearly all of it MTLDevice newTexture. Textures are
+    // suballocated from heaps instead, one descriptor is reused and samplers are shared (see UploadTexture).
+    std::vector<MTL::Heap*> mTextureHeaps;
+    MTL::TextureDescriptor* mUploadDescriptor = nullptr;
+    MTL::SamplerState* mSamplerCache[2 * 4 * 4] = {};
     std::vector<FramebufferMetal> mFramebuffers;
+    // The multisampled depth textures, one per size and sample count shared by the render targets that have one: like the
+    // N64's single Z buffer, only the drawing in progress needs it (a target gets its depth cleared when it is selected)
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, MTL::Texture*> mSharedMsaaDepth;
+    MTL::Texture* AcquireMsaaDepth(uint32_t width, uint32_t height, uint32_t msaa_level);
     FrameUniforms mFrameUniforms;
     CoordUniforms mCoordUniforms;
     DrawUniforms mDrawUniforms;
