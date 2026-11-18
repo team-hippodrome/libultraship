@@ -2895,7 +2895,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     const int anchor = !mFbActive && AdjXForAspectRatio(1.0f) < 0.999f ? sAnchor : 0;
-    if (mRdp->viewport_or_scissor_changed || anchor != sAppliedAnchor) {
+    // PORT: texture rectangles in the main picture are placed in the 4:3 area of a wider picture (GfxDpTextureRectangle,
+    // unless sWideRects or a widened pattern), so a scissor box narrower than the screen is mapped there too for them,
+    // around the picture's centre. Mapped onto the whole wide picture, the order screen's scrolling side bar box sat
+    // right of the bar and cut all its text away. Triangles keep the box as it was. PORT_NO_RECT_SCISSOR_43=1: off.
+    static const bool sNoRectScissor43 = getenv("PORT_NO_RECT_SCISSOR_43") != nullptr;
+    const bool rectScissor43 = is_rect && !sNoRectScissor43 && !mFbActive && !sWideRects && !sWidePattern &&
+                               anchor == 0 && AdjXForAspectRatio(1.0f) < 0.999f;
+    static bool sAppliedRectScissor43 = false;
+    if (mRdp->viewport_or_scissor_changed || anchor != sAppliedAnchor || rectScissor43 != sAppliedRectScissor43) {
+        sAppliedRectScissor43 = rectScissor43;
         // PORT: anchored HUD (sAnchor): viewport and scissor move by the margin beside the 4:3 frame
         const int32_t shift = (anchor == 2 ? 0 : anchor) *
                               (int32_t)lroundf(mCurDimensions.width * (1.0f - AdjXForAspectRatio(1.0f)) / 2.0f);
@@ -2908,6 +2917,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mRenderingState.viewport = viewport;
         }
         XYWidthHeight scissor = mRdp->scissor;
+        if (rectScissor43) {
+            XYWidthHeight full = { 0, (int16_t)mNativeDimensions.height, mNativeDimensions.width,
+                                   mNativeDimensions.height };
+            AdjustVIewportOrScissor(&full);
+            const int32_t sx0 = scissor.x, sx1 = scissor.x + (int32_t)scissor.width;
+            if (full.width > 0 && (sx0 > full.x || sx1 < full.x + (int32_t)full.width)) { // narrower than the screen
+                const float cx = full.x + full.width / 2.0f;
+                const float k = AdjXForAspectRatio(1.0f);
+                const float x0 = floorf(cx + (sx0 - cx) * k), x1 = ceilf(cx + (sx1 - cx) * k);
+                scissor.x = (int16_t)x0;
+                scissor.width = (uint32_t)std::max(0.0f, x1 - x0);
+            }
+        }
         if (shift != 0) {
             const int32_t x0 = std::max<int32_t>(0, scissor.x + shift);
             const int32_t x1 = std::max<int32_t>(x0, scissor.x + shift + (int32_t)scissor.width);
