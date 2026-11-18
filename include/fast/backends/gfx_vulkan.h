@@ -29,7 +29,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <shared_mutex>
 #include <thread>
 #include <stdexcept>
 
@@ -296,7 +295,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     uint32_t PipelineSlot(uint32_t key) const;
     std::vector<uint32_t> WarmPipelineSlots(const std::vector<uint32_t>& recipes) const;
     void RecordPipeline(uint64_t shaderId0, uint64_t shaderId1, uint32_t key);
-    void SavePipelineCache();
+    void SavePipelineCache(bool wait = true);
     void MaybeSavePipelineCache();
     void DestroyShaderProgram(ShaderProgramVK& prg);
     void EnsureUploadCmd();
@@ -382,7 +381,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     std::string mPipelineCachePath;
     std::atomic<bool> mPipelineCacheDirty{ false }; // set by workers too
     std::atomic<double> mPipelineCacheSavedMs{ 0.0 };  // steady clock
-    std::shared_mutex mPipelineCacheLock;              // shared: creating a pipeline; exclusive: saving the cache
+    std::mutex mPipelineCacheSaveMutex;                // one save at a time (pipeline creation never waits)
     std::atomic<int> mPipelineCacheSaves{ 0 };
     std::atomic<int> mPipelinesCreated{ 0 };
     std::atomic<int> mPipelineCacheHits{ 0 }; // creation feedback: found in the pipeline cache

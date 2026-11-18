@@ -559,6 +559,36 @@ GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
     for (auto& t : mPrebuildThreads) {
         t.join();
     }
+
+    // PORT: give back the texture heaps and shared samplers. Wait for the GPU first: a command buffer still in flight holds its textures,
+    // and the heap textures go before their heaps.
+    for (MTL::CommandQueue* queue : { mCommandQueue, mReadbackQueue }) {
+        if (queue != nullptr) {
+            MTL::CommandBuffer* cb = queue->commandBuffer();
+            cb->commit();
+            cb->waitUntilCompleted();
+        }
+    }
+    for (auto& tex : mTextures) {
+        if (tex.texture != nullptr && tex.texture->heap() != nullptr) {
+            tex.texture->release();
+            tex.texture = nullptr;
+        }
+    }
+    for (MTL::Heap* heap : mTextureHeaps) {
+        heap->release();
+    }
+    mTextureHeaps.clear();
+    for (MTL::SamplerState*& sampler : mSamplerCache) {
+        if (sampler != nullptr) {
+            sampler->release();
+            sampler = nullptr;
+        }
+    }
+    if (mUploadDescriptor != nullptr) {
+        mUploadDescriptor->release();
+        mUploadDescriptor = nullptr;
+    }
     for (auto& fb : mFramebuffers) {
         fb.mMsaaDepthTexture = nullptr;
     }
@@ -624,6 +654,87 @@ void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
     mCurrentTextureIds[tile] = texture_id;
 }
 
+// PORT: texture heaps (see UploadTexture). Heaps are never shrunk by Metal, and mixed-size churn (scene changes, HD
+// texture reloads) can leave free space no new texture fits in, so: at most kMaxHeaps of them, beyond that textures
+// come from the device; heaps left empty are given back, one kept spare so the next scene change doesn't have to make
+// one again. Trace: PORT_MTL_HEAP_TRACE=1.
+static constexpr uint64_t kHeapMaxTexture = 256 * 1024;
+static constexpr size_t kMaxHeaps = 8; // 128 MB
+static constexpr uint32_t kHeapTrimIntervalFrames = 60;
+static const bool sHeapTrace = getenv("PORT_MTL_HEAP_TRACE") != nullptr;
+// debug: PORT_MTL_HEAP_KB=<n> makes the heaps that small (at least 512 KB), to exercise the cap and the trimming
+static const uint64_t kHeapSize = [] {
+    const char* kb = getenv("PORT_MTL_HEAP_KB");
+    return kb != nullptr ? std::max<uint64_t>(512, strtoull(kb, nullptr, 10)) * 1024 : 16 * 1024 * 1024;
+}();
+
+MTL::Texture* GfxRenderingAPIMetal::NewHeapTexture() {
+    mUploadDescriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked); // the heaps' mode
+    // The heap the last texture came from first (nearly always room there), then the others, newest first: one
+    // newTexture try per heap, at most kMaxHeaps of them.
+    const size_t count = mTextureHeaps.size();
+    if (mHeapHint < count) {
+        if (MTL::Texture* texture = mTextureHeaps[mHeapHint]->newTexture(mUploadDescriptor)) {
+            return texture;
+        }
+    }
+    for (size_t i = count; i-- > 0;) {
+        if (i == mHeapHint) {
+            continue;
+        }
+        if (MTL::Texture* texture = mTextureHeaps[i]->newTexture(mUploadDescriptor)) {
+            mHeapHint = i;
+            return texture;
+        }
+    }
+    if (count >= kMaxHeaps) {
+        if (sHeapTrace) {
+            fprintf(stderr, "[mtl-heap] all %zu heaps full: a device texture\n", count);
+        }
+        return nullptr;
+    }
+    MTL::HeapDescriptor* heap_descriptor = MTL::HeapDescriptor::alloc()->init();
+    heap_descriptor->setSize(kHeapSize);
+    heap_descriptor->setStorageMode(MTL::StorageModeShared);
+    heap_descriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
+    MTL::Heap* heap = mDevice->newHeap(heap_descriptor);
+    heap_descriptor->release();
+    if (heap == nullptr) {
+        return nullptr;
+    }
+    mTextureHeaps.push_back(heap);
+    mHeapHint = mTextureHeaps.size() - 1;
+    if (sHeapTrace) {
+        fprintf(stderr, "[mtl-heap] new heap: %zu heaps\n", mTextureHeaps.size());
+    }
+    return heap->newTexture(mUploadDescriptor);
+}
+
+void GfxRenderingAPIMetal::TrimTextureHeaps() {
+    // A heap's usedSize counts its live textures, and a texture lives while the backend or a command buffer (they
+    // retain what they encode) holds it: at 0 nothing on the CPU or GPU uses the heap any more, so it can go.
+    bool kept_spare = false;
+    size_t freed = 0;
+    for (size_t i = mTextureHeaps.size(); i-- > 0;) {
+        if (mTextureHeaps[i]->usedSize() != 0) {
+            continue;
+        }
+        if (!kept_spare) {
+            kept_spare = true;
+            continue;
+        }
+        mTextureHeaps[i]->release();
+        mTextureHeaps.erase(mTextureHeaps.begin() + i);
+        freed++;
+    }
+    if (freed != 0) {
+        mHeapHint = mTextureHeaps.size() - 1; // (the spare at least is left)
+        if (sHeapTrace) {
+            fprintf(stderr, "[mtl-heap] gave back %zu empty heaps: %zu heaps\n", freed, mTextureHeaps.size());
+        }
+    }
+}
+
 void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         return;
@@ -649,8 +760,9 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
     MTL::Texture* texture = texture_data->texture;
     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
         texture_data->texture->height() != height) {
-        if (texture_data->texture != nullptr)
-            texture_data->texture->release();
+        if (texture_data->texture != nullptr) {
+            texture_data->texture->release(); // (a heap's: the space returns once no command buffer holds it)
+        }
 
         mUploadDescriptor->setWidth(width);
         mUploadDescriptor->setHeight(height);
@@ -660,24 +772,8 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
         // the cup_giveup replay; from a heap 1.3 / 2.2 / 14 us). Textures too big to be worth sharing a heap
         // (framebuffer copies, HD textures) go to the device. The CPU writes these (replaceRegion) and the GPU only
         // reads them, so the heaps and their textures need no hazard tracking, which would only add per-draw work.
-        constexpr uint64_t kHeapMaxTexture = 256 * 1024, kHeapSize = 16 * 1024 * 1024;
         if (!sNoHeap && (uint64_t)width * height * 4 <= kHeapMaxTexture) {
-            mUploadDescriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked); // the heaps' mode
-            for (auto it = mTextureHeaps.rbegin(); it != mTextureHeaps.rend() && texture == nullptr; ++it) {
-                texture = (*it)->newTexture(mUploadDescriptor);
-            }
-            if (texture == nullptr) {
-                MTL::HeapDescriptor* heap_descriptor = MTL::HeapDescriptor::alloc()->init();
-                heap_descriptor->setSize(kHeapSize);
-                heap_descriptor->setStorageMode(MTL::StorageModeShared);
-                heap_descriptor->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
-                MTL::Heap* heap = mDevice->newHeap(heap_descriptor);
-                heap_descriptor->release();
-                if (heap != nullptr) {
-                    mTextureHeaps.push_back(heap);
-                    texture = heap->newTexture(mUploadDescriptor);
-                }
-            }
+            texture = NewHeapTexture();
         }
         if (texture == nullptr) {
             mUploadDescriptor->setHazardTrackingMode(MTL::HazardTrackingModeDefault);
@@ -897,6 +993,11 @@ void GfxRenderingAPIMetal::StartFrame() {
     mCurrentVertexBufferOffset = 0;
 
     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
+
+    if (mTextureHeaps.size() > 1 && ++mHeapTrimCountdown >= kHeapTrimIntervalFrames) {
+        mHeapTrimCountdown = 0;
+        TrimTextureHeaps();
+    }
 }
 
 void GfxRenderingAPIMetal::EndFrame() {
