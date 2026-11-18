@@ -93,6 +93,9 @@ struct ProjectedVertex {
             float3 input@{i + 1};
         @end
     @end
+    // The RDP shades linearly in screen space; inputs go out multiplied by w and are divided by the
+    // interpolated w in the fragment shader, which cancels the perspective weighting (see the OpenGL shader)
+    float shadeW;
     float4 position [[position]];
 };
 
@@ -113,14 +116,15 @@ vertex ProjectedVertex vertexShader(Vertex in [[stage_in]]) {
         @end
     @end
     @if(o_fog)
-        out.fog = in.fog;
+        out.fog = in.fog * in.position.w;
     @end
     @if(o_grayscale)
         out.grayscale = in.grayscale;
     @end
     @for(i in 0..o_inputs)
-         out.input@{i + 1} = in.input@{i + 1};
+         out.input@{i + 1} = in.input@{i + 1} * in.position.w;
     @end
+    out.shadeW = in.position.w;
     out.position = in.position;
     return out;
 }
@@ -165,7 +169,7 @@ float random(float3 value) {
 }
 
 fragment FragOut fragmentShader(
-    ProjectedVertex in [[stage_in]],
+    ProjectedVertex inW [[stage_in]],
     constant FrameUniforms &frameUniforms [[buffer(0)]],
     constant DrawUniforms &drawUniforms [[buffer(1)]]
 @if(o_textures[0])
@@ -187,6 +191,13 @@ fragment FragOut fragmentShader(
     , texture2d<float> uTexBlend1 [[texture(5)]]
 @end
 ) {
+    ProjectedVertex in = inW;
+    @if(o_fog)
+        in.fog /= inW.shadeW;
+    @end
+    @for(i in 0..o_inputs)
+        in.input@{i + 1} /= inW.shadeW;
+    @end
     @for(i in 0..2)
         @if(o_textures[i])
             @{s = o_clamp[i][0]}

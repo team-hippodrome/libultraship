@@ -2648,6 +2648,111 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
+    // The RDP interpolates shade linearly in screen space (the shaders undo the GPU's perspective weighting of the
+    // shade inputs), so where the RSP splits a triangle changes the result. F3DEX2 clips a triangle that crosses the
+    // near plane or the guard band (clip ratio 2: |x| or |y| beyond 2w) into a polygon whose new vertices take colors
+    // and texture coordinates interpolated in clip space. Do the same so large off-screen triangles shade as on the
+    // N64.
+    static const float sClipRatio = 2.0f;
+    if (!is_rect && !mInRspClip && !(v1->ortho && v2->ortho && v3->ortho)) {
+        auto planeDistance = [](const LoadedVertex* v, int plane) -> float {
+            switch (plane) {
+                case 0:
+                    return v->x + sClipRatio * v->w;
+                case 1:
+                    return sClipRatio * v->w - v->x;
+                case 2:
+                    return v->y + sClipRatio * v->w;
+                case 3:
+                    return sClipRatio * v->w - v->y;
+                default:
+                    return v->z + v->w; // near plane
+            }
+        };
+        uint32_t outsideMask[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            for (int plane = 0; plane < 5; plane++) {
+                if (planeDistance(v_arr[i], plane) < 0.0f) {
+                    outsideMask[i] |= 1u << plane;
+                }
+            }
+        }
+        if ((outsideMask[0] | outsideMask[1] | outsideMask[2]) != 0) {
+            if ((outsideMask[0] & outsideMask[1] & outsideMask[2]) != 0) {
+                // Entirely outside one plane: the RSP draws nothing
+                return;
+            }
+            LoadedVertex polyA[16];
+            LoadedVertex polyB[16];
+            LoadedVertex* in = polyA;
+            LoadedVertex* out = polyB;
+            int count = 3;
+            for (int i = 0; i < 3; i++) {
+                in[i] = *v_arr[i];
+            }
+            for (int plane = 0; plane < 5 && count >= 3; plane++) {
+                int outCount = 0;
+                for (int i = 0; i < count; i++) {
+                    const LoadedVertex& a = in[i];
+                    const LoadedVertex& b = in[(i + 1) % count];
+                    const float distA = planeDistance(&a, plane);
+                    const float distB = planeDistance(&b, plane);
+                    if (distA >= 0.0f && outCount < 16) {
+                        out[outCount++] = a;
+                    }
+                    if ((distA >= 0.0f) != (distB >= 0.0f) && outCount < 16) {
+                        const float t = distA / (distA - distB);
+                        LoadedVertex c = a;
+                        c.x = a.x + (b.x - a.x) * t;
+                        c.y = a.y + (b.y - a.y) * t;
+                        c.z = a.z + (b.z - a.z) * t;
+                        c.w = a.w + (b.w - a.w) * t;
+                        c.u = a.u + (b.u - a.u) * t;
+                        c.v = a.v + (b.v - a.v) * t;
+                        c.color.r = (uint8_t)lroundf(a.color.r + (b.color.r - a.color.r) * t);
+                        c.color.g = (uint8_t)lroundf(a.color.g + (b.color.g - a.color.g) * t);
+                        c.color.b = (uint8_t)lroundf(a.color.b + (b.color.b - a.color.b) * t);
+                        c.color.a = (uint8_t)lroundf(a.color.a + (b.color.a - a.color.a) * t);
+                        c.x_edge = NAN;
+                        out[outCount++] = c;
+                    }
+                }
+                std::swap(in, out);
+                count = outCount;
+            }
+            if (count < 3) {
+                return;
+            }
+            const int base = MAX_VERTICES + 4;
+            for (int i = 0; i < count; i++) {
+                LoadedVertex& d = mRsp->loaded_vertices[base + i];
+                d = in[i];
+                d.clip_rej = 0;
+                if (d.x < -d.w) {
+                    d.clip_rej |= 1;
+                }
+                if (d.x > d.w) {
+                    d.clip_rej |= 2;
+                }
+                if (d.y < -d.w) {
+                    d.clip_rej |= 4;
+                }
+                if (d.y > d.w) {
+                    d.clip_rej |= 8;
+                }
+                if (d.z > d.w) {
+                    d.clip_rej |= 32;
+                }
+            }
+            mInRspClip = true;
+            for (int i = 1; i + 1 < count; i++) {
+                GfxSpTri1(base, base + i, base + i + 1, false);
+            }
+            mInRspClip = false;
+            return;
+        }
+    }
+
     // if (rand()%2) return;
     static int sTot = 0, sClip = 0;
     static bool sLog = getenv("PORT_TRILOG") != nullptr;

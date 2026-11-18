@@ -46,6 +46,9 @@ float4 grayscale : GRAYSCALE;
         @{update_floats(3)}
     @end
 @end
+// The RDP shades linearly in screen space; inputs go out multiplied by w and are divided by the
+// interpolated w in the pixel shader, which cancels the perspective weighting (see the OpenGL shader)
+float shadeW : SHADEW;
 };
 
 @if(o_textures[0]) 
@@ -153,8 +156,9 @@ PSInput VSMain(
     @end
 
     @if(o_fog)
-        result.fog = fog;
+        result.fog = fog * position.w;
     @end
+    result.shadeW = position.w;
 
     @if(o_grayscale)
         result.grayscale = grayscale;
@@ -162,9 +166,9 @@ PSInput VSMain(
 
     @for(i in 0..o_inputs)
         @if(o_alpha)
-            result.input@{i + 1} = input@{i + 1};
+            result.input@{i + 1} = input@{i + 1} * position.w;
         @else
-            result.input@{i + 1} = float4(input@{i + 1}, 1.0);
+            result.input@{i + 1} = float4(input@{i + 1} * position.w, 1.0);
         @end
     @end
 
@@ -199,6 +203,12 @@ struct PSOutput {
 };
 
 PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
+    @if(o_fog)
+        input.fog /= input.shadeW;
+    @end
+    @for(i in 0..o_inputs)
+        input.input@{i + 1} /= input.shadeW;
+    @end
     @for(i in 0..2)
         @if(o_textures[i])
             float2 tc@{i} = input.uv@{i};
