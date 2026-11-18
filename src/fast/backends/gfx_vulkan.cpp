@@ -26,7 +26,9 @@
 #include <sstream>
 #include <unordered_set>
 #include <chrono>
-#include <shared_mutex>
+#include <mutex>
+#include <cstdio>
+#include <filesystem>
 #ifdef __APPLE__
 #include <pthread.h>
 #include <sys/qos.h>
@@ -47,6 +49,19 @@
 #include "ship/resource/archive/ArchiveManager.h"
 #include "ship/resource/factory/ShaderFactory.h"
 #include "ship/core/Context.h"
+// last, so its macros reach only this file's code (SavePipelineCache: MoveFileExW, _commit)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 // PORT: errors that leave the device unusable (out of host or device memory, device lost) end the render loop on the
 // window thread (Fast::VulkanFatalError: the port selects OpenGL for the next start and exits). Logging and going on
@@ -1321,37 +1336,80 @@ void GfxRenderingAPIVK::RecordPipeline(uint64_t shaderId0, uint64_t shaderId1, u
 // _exit (window close, SIGTERM, PORT_STOP_AT) and may crash, so there is no saving at shutdown to rely on.
 void GfxRenderingAPIVK::MaybeSavePipelineCache() {
     if (mPipelineCacheDirty && NowMs() - mPipelineCacheSavedMs > 5000.0) {
-        SavePipelineCache();
+        SavePipelineCache(false);
     }
 }
 
-void GfxRenderingAPIVK::SavePipelineCache() {
-    // exclusive: no pipeline is created meanwhile (CreatePipeline holds the lock shared)
-    std::unique_lock<std::shared_mutex> cacheLock(mPipelineCacheLock);
-    if (mPipelineCache == VK_NULL_HANDLE || !mPipelineCacheDirty) {
+// Writes the file beside and renames it over the old one (an atomic replace), so being killed at any point leaves
+// either the old file or the new one. Pipeline creation goes on meanwhile: vkGetPipelineCacheData and
+// vkCreateGraphicsPipelines need no external synchronization on a cache created without
+// VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, and the cache lives as long as the device. One save runs at a
+// time; with wait == false a save already running elsewhere makes this one return at once.
+void GfxRenderingAPIVK::SavePipelineCache(bool wait) {
+    std::unique_lock<std::mutex> saveLock(mPipelineCacheSaveMutex, std::defer_lock);
+    if (wait) {
+        saveLock.lock();
+    } else if (!saveLock.try_lock()) {
         return;
     }
-    size_t size = 0;
-    if (vkGetPipelineCacheData(mDevice, mPipelineCache, &size, nullptr) != VK_SUCCESS || size == 0) {
+    // cleared before the data is read: a pipeline created from here on marks it dirty again for the next save
+    if (mPipelineCache == VK_NULL_HANDLE || !mPipelineCacheDirty.exchange(false)) {
         return;
     }
-    std::vector<uint8_t> data(size);
-    if (vkGetPipelineCacheData(mDevice, mPipelineCache, &size, data.data()) != VK_SUCCESS) {
-        return;
-    }
-    // written beside and renamed, so a crash mid-write leaves the old file
-    const std::string tmp = mPipelineCachePath + ".tmp";
-    if (FILE* f = fopen(tmp.c_str(), "wb")) {
-        const bool ok = fwrite(data.data(), 1, size, f) == size;
-        fclose(f);
-        if (ok) {
-            std::remove(mPipelineCachePath.c_str());
-            std::rename(tmp.c_str(), mPipelineCachePath.c_str());
+    mPipelineCacheSavedMs = NowMs(); // a failed save is retried a few seconds later, not every frame
+    std::vector<uint8_t> data;
+    VkResult res = VK_INCOMPLETE;
+    for (int attempt = 0; attempt < 4 && res == VK_INCOMPLETE; attempt++) { // the cache may grow between the calls
+        size_t size = 0;
+        if (vkGetPipelineCacheData(mDevice, mPipelineCache, &size, nullptr) != VK_SUCCESS || size == 0) {
+            res = VK_ERROR_UNKNOWN;
+            break;
         }
+        data.resize(size);
+        res = vkGetPipelineCacheData(mDevice, mPipelineCache, &size, data.data());
+        data.resize(size);
     }
-    mPipelineCacheDirty = false;
-    mPipelineCacheSavedMs = NowMs();
-    mPipelineCacheSaves++;
+    if (res != VK_SUCCESS || data.empty()) {
+        mPipelineCacheDirty = true;
+        return;
+    }
+    namespace fs = std::filesystem;
+    const std::string tmpName = mPipelineCachePath + ".tmp";
+    const fs::path path(reinterpret_cast<const char8_t*>(mPipelineCachePath.c_str())); // UTF-8
+    const fs::path tmp(reinterpret_cast<const char8_t*>(tmpName.c_str()));
+#ifdef _WIN32
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+#else
+    FILE* f = fopen(tmp.c_str(), "wb");
+#endif
+    bool ok = f != nullptr;
+    if (ok) {
+        ok = fwrite(data.data(), 1, data.size(), f) == data.size() && fflush(f) == 0;
+#ifdef _WIN32
+        ok = ok && _commit(_fileno(f)) == 0;
+#else
+        ok = ok && fsync(fileno(f)) == 0;
+#endif
+        ok = fclose(f) == 0 && ok;
+    }
+    if (ok) {
+#ifdef _WIN32
+        ok = MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+#endif
+    }
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        SPDLOG_WARN("Vulkan: could not save the pipeline cache to {}; the previous file was kept", mPipelineCachePath);
+        mPipelineCacheDirty = true;
+        return;
+    }
+    const int saves = ++mPipelineCacheSaves;
+    if (sTraceWarmup) {
+        fprintf(stderr, "[vkcache] pipeline cache saved (%d): %zu KB\n", saves, data.size() / 1024);
+    }
 }
 
 // PORT: shader warm-up (Interpreter::QueueShaderWarmup): the programs earlier runs drew, built on worker threads with
@@ -1460,6 +1518,9 @@ void GfxRenderingAPIVK::PrebuildWorker() {
         lock.lock();
     }
     if (--mPrebuildRunning == 0) {
+        // read under the lock: PrebuildShadersAsync may queue more meanwhile
+        const size_t queued = mPrebuildQueue.size(), builtAhead = mPrebuildBuilt;
+        const double ms = MsSince(mPrebuildStart);
         lock.unlock();
         SavePipelineCache();
         if (sTraceWarmup) {
@@ -1467,14 +1528,14 @@ void GfxRenderingAPIVK::PrebuildWorker() {
             fprintf(stderr,
                     "[vkcache] warm-up done: %zu programs queued, %zu built ahead, in %.0f ms; SPIR-V cache %d hits, "
                     "%d compiled; pipelines %d created, %s; pipeline cache saved %d times\n",
-                    mPrebuildQueue.size(), mPrebuildBuilt, MsSince(mPrebuildStart), sSpirvCacheHits.load(),
+                    queued, builtAhead, ms, sSpirvCacheHits.load(),
                     sSpirvCompiles.load(), created,
                     mHasCreationFeedback ? (std::to_string(hits) + " from the pipeline cache").c_str()
                                          : "cache hits not reported by this driver",
                     mPipelineCacheSaves.load());
         }
         SPDLOG_INFO("Vulkan warm-up: {} programs, {} built ahead, {:.0f} ms; pipeline cache hits {}/{}",
-                    mPrebuildQueue.size(), mPrebuildBuilt, MsSince(mPrebuildStart), mPipelineCacheHits.load(),
+                    queued, builtAhead, ms, mPipelineCacheHits.load(),
                     mPipelinesCreated.load());
         lock.lock();
     }
@@ -2134,10 +2195,8 @@ VkPipeline GfxRenderingAPIVK::CreatePipeline(const BuiltProgramVK& prg, uint32_t
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult res;
-    {
-        std::shared_lock<std::shared_mutex> cacheLock(mPipelineCacheLock);
-        res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
-    }
+    // no lock: SavePipelineCache reads the cache meanwhile, which Vulkan allows (see there)
+    res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
     mPipelinesCreated++;
     if (res == VK_SUCCESS && (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT) != 0 &&
         (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT) != 0) {
@@ -3054,7 +3113,7 @@ void GfxRenderingAPIVK::EndFrame() {
         std::unique_lock<std::mutex> lock(mPrebuildMutex);
         if (mPrebuildRunning == 0) {
             lock.unlock();
-            SavePipelineCache();
+            SavePipelineCache(false);
         }
     }
 
