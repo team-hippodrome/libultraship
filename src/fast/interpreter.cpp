@@ -4678,6 +4678,22 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
         }
         auto it = sOffscreenFbs.find((uintptr_t)address);
         if (it != sOffscreenFbs.end()) {
+            // PORT: the CPU has overwritten the target's stamp since it was last drawn (Zero clears a Pokémon icon's
+            // image before it renders the next Pokémon there). Left like that, the drawing about to happen was never
+            // read back nor sampled (the target counted as stale) and the texture showed the cleared RDRAM: the VS
+            // panel's top-row COM icons from round 2 on, whose images had the results board's faint cross (with the
+            // plain black icons the cleared corner still matched the stamp). The game is drawing into it, so it is a
+            // render target again: the CPU's pixels go to the GPU first (they are the picture now, as in RDRAM on the
+            // N64), then the stamp. Same framebuffer, so nothing piles up on the GPU.
+            RttFinishIfPending((const void*)it->first, (size_t)it->second.w * it->second.h * 2);
+            static const bool sNoRestamp = getenv("PORT_NO_RTT_RESTAMP") != nullptr; // debug: the old behaviour
+            if (!sNoRestamp && !RttStampValid(it->first, it->second)) {
+                if (PortTexLog()) fprintf(stderr, "[rtt] target at %p overwritten by the CPU: reloaded\n", address);
+                RttInitialize(it->second.fb, it->first, it->second.w, it->second.h);
+                RttStamp(it->first, &it->second);
+            }
+        }
+        if (it != sOffscreenFbs.end()) {
             if (sInOffscreen) {
                 RttReadback();
             }
