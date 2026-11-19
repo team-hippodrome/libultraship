@@ -326,9 +326,36 @@ struct FrameTimeStats {
 };
 } // namespace
 
+// Setup of the backend frames (the window's drawable) and the initial Window and GUI menus
+void Fast3dWindow::BeginPicture() {
+    GetMouseStateManager()->StartFrame();
+    GetGui()->StartDraw();
+    // Setup game framebuffers to match available window space
+    mInterpreter->StartFrame();
+}
+
+bool Fast3dWindow::RunCommandsIntoNextPicture(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
+    if (!mPictureOpen) {
+        BeginPicture();
+        mPictureOpen = true;
+    }
+    mInterpreter->mRunNotLast = true;
+    mInterpreter->Run(commands, mtxReplacements);
+    mInterpreter->mRunNotLast = false;
+    return true;
+}
+
+void Fast3dWindow::EndOpenPicture() {
+    if (mPictureOpen) {
+        mPictureOpen = false;
+        GetGui()->EndDraw();
+        mInterpreter->EndFrame();
+    }
+}
+
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
-    // Skip dropped frames
-    if (!IsFrameReady()) {
+    // Skip dropped frames (PORT: not one whose picture already began)
+    if (!mPictureOpen && !IsFrameReady()) {
         // PORT: a dropped frame still updates the persistent RSP/RDP state; one that renders to a texture is drawn
         if (!mInterpreter->TrackSegmentsOnly(commands)) {
             return false;
@@ -339,13 +366,11 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     const bool trace = TraceFrameTime();
     const auto t0 = trace ? Clock::now() : Clock::time_point{};
     auto gui = GetGui();
-    // Setup mouse state manager
-    GetMouseStateManager()->StartFrame();
-    // Setup of the backend frames and draw initial Window and GUI menus
-    gui->StartDraw();
+    if (!mPictureOpen) {
+        BeginPicture();
+    }
+    mPictureOpen = false;
     const auto t1 = trace ? Clock::now() : Clock::time_point{};
-    // Setup game framebuffers to match available window space
-    mInterpreter->StartFrame();
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
     const auto t2 = trace ? Clock::now() : Clock::time_point{};

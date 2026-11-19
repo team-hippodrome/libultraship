@@ -7609,7 +7609,9 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
-    mRapi->StartFrame();
+    if (mRunsThisPicture++ == 0) {
+        mRapi->StartFrame();
+    }
     WarmupStep();
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     // PORT: the N64 never clears its frame buffer by itself; games clear it with a fill rectangle when they need to.
@@ -7681,7 +7683,9 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mGfxFrameBufferFb = -1;
     currentDir = std::stack<std::string>();
 
-    if (mRendersToFb) {
+    if (mRunNotLast) {
+        // (another display list follows in this picture: it continues drawing into the game frame buffer)
+    } else if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
@@ -7716,6 +7720,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 }
 
 void Interpreter::EndFrame() {
+    mRunsThisPicture = 0;
     const bool traceTiming = TraceRenderTiming();
     const auto start = traceTiming ? RenderClock::now() : RenderClock::time_point{};
     gPortReplayFrame = mReplayPass && !mReplayReadback;

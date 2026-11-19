@@ -109,6 +109,15 @@ class Fast3dWindow : public Ship::Window {
     void SetRendererUCode(UcodeHandlers ucode);
     void EnableSRGBMode();
     bool DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
+    // PORT: runs a display list into the game's frame buffers as part of the next picture, which has not been shown
+    // yet (it begins here if needed); the next DrawAndRunGraphicsCommands adds its own display list and shows the
+    // picture. Nothing is presented for this one: no window pass, no swap, no wait for a refresh.
+    bool RunCommandsIntoNextPicture(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
+    // PORT: shows a picture RunCommandsIntoNextPicture began (when no DrawAndRunGraphicsCommands follows)
+    void EndOpenPicture();
+    bool PictureOpen() const {
+        return mPictureOpen;
+    }
 
     std::weak_ptr<Interpreter> GetInterpreterWeak() const;
 
@@ -126,6 +135,8 @@ class Fast3dWindow : public Ship::Window {
     static void OnFullscreenChanged(bool isNowFullscreen);
 
   private:
+    void BeginPicture();
+    bool mPictureOpen = false;
     GfxRenderingAPI* mRenderingApi;
     GfxWindowBackend* mWindowManagerApi;
     std::shared_ptr<Interpreter> mInterpreter = nullptr;
