@@ -427,12 +427,12 @@ static bool IsFrameBufferSelfCopy(const Fast::RDP* rdp, uint8_t tile, int32_t ul
 static bool sPendingOffscreenPreserve = false;
 static uint32_t sPendingOffscreenWidth = 0;
 static bool sInOffscreen = false;
-// PORT: an in-between picture of frame interpolation (mReplayPass) draws the frame's display list again later, while
+// An in-between picture of frame interpolation (mReplayPass) draws the frame's display list again later, while
 // the game is already building its next frame. Render targets are pictures in the game's memory: they keep what the
 // frame drew into them, so a replay draws nothing into them (sReplaySkipTarget: its drawing is dropped, its state
 // changes still happen). Drawn again, they used whatever the game had put in that memory since: the order screen's
 // Pokémon icons are drawn one a frame from one model buffer, and the replay drew an icon with the next Pokémon's
-// model (Nidoking scrambled, Nidoqueen in Pikachu's colours). PORT_INTERP_REDRAW_TARGETS=1: the old behaviour.
+// model (Nidoking scrambled, Nidoqueen in Pikachu's colours).
 static bool sReplaySkipTarget = false;
 static uintptr_t sCurOffscreenAddr = 0; // RDRAM address of the render target being drawn
 // PORT: one persistent GPU framebuffer per N64 frame buffer (colour image address). The N64 rotates two or three frame
@@ -4704,9 +4704,8 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
     if (!offscreen && IsUnshownScreenImage(pixelWidth, address)) {
         offscreen = true;
     }
-    static const bool sRedrawTargets = getenv("PORT_INTERP_REDRAW_TARGETS") != nullptr; // debug: the old behaviour
     Flush(); // (what was drawn before goes where it belongs, then sReplaySkipTarget follows the new colour image)
-    sReplaySkipTarget = offscreen && mReplayPass && !sRedrawTargets;
+    sReplaySkipTarget = offscreen && mReplayPass;
     if (sReplaySkipTarget) {
         // A target the first drawing created or drew into stays bound as it was then: the same state for the rest of
         // the list. One missing now (forgotten since) is not created again: its drawing is dropped either way.
