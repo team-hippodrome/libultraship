@@ -111,6 +111,9 @@ static const bool sTraceWarmup =
 static std::atomic<int> sSpirvCacheHits{ 0 }, sSpirvCompiles{ 0 };
 static struct {
     int programs = 0, prebuiltPrograms = 0, pipelines = 0, syncSubmits = 0, commandBuffers = 0, commandBuffersAllocated = 0;
+    // GPU work per picture (the counts carry over to other GPUs, unlike this host's timings)
+    int uploads = 0, imageAllocs = 0, barriers = 0, passes = 0, copies = 0, resolves = 0, draws = 0;
+    size_t uploadBytes = 0;
     double programMs = 0, pipelineMs = 0, syncMs = 0, fenceMs = 0, acquireMs = 0;
 } sStat;
 static double MsSince(std::chrono::steady_clock::time_point t) {
@@ -386,6 +389,7 @@ const uint8_t* GfxRenderingAPIVK::ReadbackData(ReadbackBuffer& rb) {
 
 void GfxRenderingAPIVK::CreateImage(uint32_t width, uint32_t height, VkSampleCountFlagBits samples, VkFormat format,
                                     VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory) {
+    sStat.imageAllocs++;
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.extent = { width, height, 1 };
@@ -435,6 +439,7 @@ void GfxRenderingAPIVK::TransitionToGeneral(VkCommandBuffer cmd, VkImage image, 
 
 // Conservative everything-to-everything barrier used around blits/copies.
 void GfxRenderingAPIVK::FullBarrier(VkCommandBuffer cmd) {
+    sStat.barriers++;
     VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1959,6 +1964,8 @@ void GfxRenderingAPIVK::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, 
     if (width == 0 || height == 0) {
         return;
     }
+    sStat.uploads++;
+    sStat.uploadBytes += (size_t)width * height * 4;
 
     TextureDataVK& tex = mTextures[mCurrentTextureIds[mCurrentTile]];
 
@@ -2239,6 +2246,7 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
 }
 
 void GfxRenderingAPIVK::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+    sStat.draws++;
     if (mShaderProgram == nullptr || mShaderProgram->built.vs == VK_NULL_HANDLE || !mFrameActive) {
         return;
     }
@@ -2373,6 +2381,7 @@ void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
     if (fb.mPassActive) {
         return;
     }
+    sStat.passes++;
 
     if (fb.mCommandBuffer == VK_NULL_HANDLE) {
         fb.mCommandBuffer = AcquireCommandBuffer();
@@ -2713,6 +2722,7 @@ void GfxRenderingAPIVK::UpdateFramebufferParameters(int fbId, uint32_t width, ui
 // PORT: the copy goes into streamFb's command buffer (submitted in framebuffer-id order), between what was drawn into
 // it so far and what comes next
 void GfxRenderingAPIVK::CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) {
+    sStat.copies++;
     if (streamFb >= (int)mFramebuffers.size() || dstFb >= (int)mFramebuffers.size() ||
         srcFb >= (int)mFramebuffers.size() || !mFrameActive) {
         return;
@@ -2780,6 +2790,7 @@ void GfxRenderingAPIVK::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int
 }
 
 void GfxRenderingAPIVK::ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) {
+    sStat.resolves++;
     if (fbIdSrc >= (int)mFramebuffers.size() || fbIdTarget >= (int)mFramebuffers.size() || !mFrameActive) {
         return;
     }
@@ -3125,6 +3136,11 @@ void GfxRenderingAPIVK::EndFrame() {
                 sStat.programs, sStat.prebuiltPrograms, sStat.programMs, sStat.pipelines, sStat.pipelineMs, sStat.syncSubmits, sStat.syncMs,
                 sStat.fenceMs, sStat.acquireMs, sStat.commandBuffers, sStat.commandBuffersAllocated,
                 mFrames[0].commandBuffers.size(), mFrames[VK_FRAMES_IN_FLIGHT - 1].commandBuffers.size());
+        fprintf(stderr,
+                "[vkstats] per picture: %.1f draws, %.1f render passes, %.1f barriers, %.2f copies, %.2f resolves, %.2f "
+                "uploads (%.0f KB), %.2f image allocations\n",
+                sStat.draws / 60.0, sStat.passes / 60.0, sStat.barriers / 60.0, sStat.copies / 60.0, sStat.resolves / 60.0,
+                sStat.uploads / 60.0, sStat.uploadBytes / 60.0 / 1024.0, sStat.imageAllocs / 60.0);
         sStat = {};
         sStatFrames = 0;
     }
