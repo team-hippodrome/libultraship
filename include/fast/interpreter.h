@@ -418,6 +418,13 @@ class Interpreter {
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
+    // PORT: display lists run since the picture began (EndFrame ends it). A picture can draw several (Fast3dWindow::
+    // RunCommandsIntoNextPicture); the rendering API's per-frame setup runs before the first only: Metal's restarts the
+    // vertex buffer, which the earlier display lists' draws still read from.
+    int mRunsThisPicture = 0;
+    // PORT: set for a display list that is not the picture's last (RunCommandsIntoNextPicture): it leaves the game
+    // frame buffer as it is (no MSAA resolve, no window pass), which the last one does for the picture
+    bool mRunNotLast = false;
     // PORT: applies the persistent RSP/RDP state changes (segments, texture loads) of a frame that is not drawn.
     bool TrackSegmentsOnly(Gfx* commands); // true: the frame renders off-screen and must be drawn
     // PORT: frame interpolation (src/port/interp.cpp). True when the frame paints the whole screen (a full-screen fill

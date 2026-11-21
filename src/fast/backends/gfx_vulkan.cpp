@@ -111,6 +111,9 @@ static const bool sTraceWarmup =
 static std::atomic<int> sSpirvCacheHits{ 0 }, sSpirvCompiles{ 0 };
 static struct {
     int programs = 0, prebuiltPrograms = 0, pipelines = 0, syncSubmits = 0, commandBuffers = 0, commandBuffersAllocated = 0;
+    // GPU work per picture (the counts carry over to other GPUs, unlike this host's timings)
+    int uploads = 0, imageAllocs = 0, barriers = 0, passes = 0, copies = 0, resolves = 0, draws = 0;
+    size_t uploadBytes = 0;
     double programMs = 0, pipelineMs = 0, syncMs = 0, fenceMs = 0, acquireMs = 0;
 } sStat;
 static double MsSince(std::chrono::steady_clock::time_point t) {
@@ -386,6 +389,7 @@ const uint8_t* GfxRenderingAPIVK::ReadbackData(ReadbackBuffer& rb) {
 
 void GfxRenderingAPIVK::CreateImage(uint32_t width, uint32_t height, VkSampleCountFlagBits samples, VkFormat format,
                                     VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory) {
+    sStat.imageAllocs++;
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.extent = { width, height, 1 };
@@ -435,6 +439,7 @@ void GfxRenderingAPIVK::TransitionToGeneral(VkCommandBuffer cmd, VkImage image, 
 
 // Conservative everything-to-everything barrier used around blits/copies.
 void GfxRenderingAPIVK::FullBarrier(VkCommandBuffer cmd) {
+    sStat.barriers++;
     VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1144,6 +1149,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
 
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &slot.fence));
+        VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &slot.earlyFence));
         VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VK_CHECK(vkCreateSemaphore(mDevice, &sci, nullptr, &slot.imageAvailable));
         VK_CHECK(vkCreateSemaphore(mDevice, &sci, nullptr, &slot.renderFinished));
@@ -1601,6 +1607,11 @@ void GfxRenderingAPIVK::NewFrame() {
         slot.fenceInFlight = false;
         sStat.fenceMs += MsSince(statStart);
     }
+    if (slot.earlyFenceInFlight) { // (submitted before the frame's own: done by now, but the spec wants a wait)
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+        slot.earlyFenceInFlight = false;
+    }
     CollectGarbage(slot);
     VK_CHECK(vkResetCommandPool(mDevice, slot.commandPool, 0));
     slot.commandBuffersUsed = 0; // all of the slot's command buffers are free again
@@ -1959,6 +1970,8 @@ void GfxRenderingAPIVK::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, 
     if (width == 0 || height == 0) {
         return;
     }
+    sStat.uploads++;
+    sStat.uploadBytes += (size_t)width * height * 4;
 
     TextureDataVK& tex = mTextures[mCurrentTextureIds[mCurrentTile]];
 
@@ -2239,6 +2252,7 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
 }
 
 void GfxRenderingAPIVK::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+    sStat.draws++;
     if (mShaderProgram == nullptr || mShaderProgram->built.vs == VK_NULL_HANDLE || !mFrameActive) {
         return;
     }
@@ -2373,6 +2387,7 @@ void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
     if (fb.mPassActive) {
         return;
     }
+    sStat.passes++;
 
     if (fb.mCommandBuffer == VK_NULL_HANDLE) {
         fb.mCommandBuffer = AcquireCommandBuffer();
@@ -2713,6 +2728,7 @@ void GfxRenderingAPIVK::UpdateFramebufferParameters(int fbId, uint32_t width, ui
 // PORT: the copy goes into streamFb's command buffer (submitted in framebuffer-id order), between what was drawn into
 // it so far and what comes next
 void GfxRenderingAPIVK::CopyFramebufferInStream(int streamFb, int dstFb, int srcFb, int w, int h) {
+    sStat.copies++;
     if (streamFb >= (int)mFramebuffers.size() || dstFb >= (int)mFramebuffers.size() ||
         srcFb >= (int)mFramebuffers.size() || !mFrameActive) {
         return;
@@ -2780,6 +2796,7 @@ void GfxRenderingAPIVK::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int
 }
 
 void GfxRenderingAPIVK::ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) {
+    sStat.resolves++;
     if (fbIdSrc >= (int)mFramebuffers.size() || fbIdTarget >= (int)mFramebuffers.size() || !mFrameActive) {
         return;
     }
@@ -2841,6 +2858,13 @@ void GfxRenderingAPIVK::SubmitFramebufferAndWait(int fbId) {
     VK_CHECK(vkQueueSubmit(mQueue, 1, &si, mReadbackFence));
     VK_CHECK(vkWaitForFences(mDevice, 1, &mReadbackFence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(mDevice, 1, &mReadbackFence));
+    // (the staging buffer is reused from the start: uploads SubmitRecorded handed over earlier must be done too)
+    FrameSlot& slot = mFrames[mFrameSlot];
+    if (slot.earlyFenceInFlight) {
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+        slot.earlyFenceInFlight = false;
+    }
     sStat.syncSubmits++;
     sStat.syncMs += MsSince(statStart);
 
@@ -3005,6 +3029,48 @@ GfxRenderingAPIVK::GetPixelDepth(int fbId, const std::set<std::pair<float, float
     return res;
 }
 
+// The uploads and the game frame buffers' command buffers recorded so far go to the queue now, in the order EndFrame
+// would use; the frame buffers start new ones when drawn again. The screen's (0) stays for EndFrame, which presents.
+void GfxRenderingAPIVK::SubmitRecorded() {
+    if (!mFrameActive) {
+        return;
+    }
+    std::vector<VkCommandBuffer> cmds;
+    if (mUploadCmd != VK_NULL_HANDLE) {
+        VK_CHECK(vkEndCommandBuffer(mUploadCmd));
+        cmds.push_back(mUploadCmd);
+        mUploadCmd = VK_NULL_HANDLE; // (the staging offset goes on: the data stays until the frame is done)
+    }
+    std::sort(mDrawnFramebuffers.begin(), mDrawnFramebuffers.end());
+    std::vector<int> keep;
+    for (int fbId : mDrawnFramebuffers) {
+        FramebufferVK& fb = mFramebuffers[fbId];
+        if (fbId == 0 || fb.mCommandBuffer == VK_NULL_HANDLE) {
+            keep.push_back(fbId);
+            continue;
+        }
+        EndPass(fb);
+        VK_CHECK(vkEndCommandBuffer(fb.mCommandBuffer));
+        cmds.push_back(fb.mCommandBuffer);
+        fb.mCommandBuffer = VK_NULL_HANDLE;
+        fb.mPassActive = false;
+    }
+    mDrawnFramebuffers = std::move(keep);
+    if (cmds.empty()) {
+        return;
+    }
+    FrameSlot& slot = mFrames[mFrameSlot];
+    if (slot.earlyFenceInFlight) { // (one at a time per frame slot)
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+    }
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = (uint32_t)cmds.size();
+    si.pCommandBuffers = cmds.data();
+    VK_CHECK(vkQueueSubmit(mQueue, 1, &si, slot.earlyFence));
+    slot.earlyFenceInFlight = true;
+}
+
 void GfxRenderingAPIVK::EndFrame() {
     if (!mFrameActive) {
         return;
@@ -3125,6 +3191,11 @@ void GfxRenderingAPIVK::EndFrame() {
                 sStat.programs, sStat.prebuiltPrograms, sStat.programMs, sStat.pipelines, sStat.pipelineMs, sStat.syncSubmits, sStat.syncMs,
                 sStat.fenceMs, sStat.acquireMs, sStat.commandBuffers, sStat.commandBuffersAllocated,
                 mFrames[0].commandBuffers.size(), mFrames[VK_FRAMES_IN_FLIGHT - 1].commandBuffers.size());
+        fprintf(stderr,
+                "[vkstats] per picture: %.1f draws, %.1f render passes, %.1f barriers, %.2f copies, %.2f resolves, %.2f "
+                "uploads (%.0f KB), %.2f image allocations\n",
+                sStat.draws / 60.0, sStat.passes / 60.0, sStat.barriers / 60.0, sStat.copies / 60.0, sStat.resolves / 60.0,
+                sStat.uploads / 60.0, sStat.uploadBytes / 60.0 / 1024.0, sStat.imageAllocs / 60.0);
         sStat = {};
         sStatFrames = 0;
     }

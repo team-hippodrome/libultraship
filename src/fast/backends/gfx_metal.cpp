@@ -1000,6 +1000,39 @@ void GfxRenderingAPIMetal::StartFrame() {
     }
 }
 
+// The game frame buffers' command buffers so far are committed now (they run in the order their first drawing
+// enqueued them); drawing to one again starts a new command buffer, enqueued after them. The screen's (0) stays.
+void GfxRenderingAPIMetal::SubmitRecorded() {
+    for (auto it = mDrawnFramebuffers.begin(); it != mDrawnFramebuffers.end();) {
+        FramebufferMetal& fb = mFramebuffers[*it];
+        if (*it == 0 || fb.mCommandBuffer == nullptr) {
+            ++it;
+            continue;
+        }
+        if (!fb.mHasEndedEncoding && fb.mCommandEncoder != nullptr) {
+            fb.mCommandEncoder->endEncoding();
+        }
+        TrackGpuTime(fb.mCommandBuffer);
+        fb.mCommandBuffer->commit();
+        fb.mCommandBuffer = nullptr;
+        fb.mCommandEncoder = nullptr;
+        fb.mHasEndedEncoding = false;
+        fb.mLastShaderProgram = nullptr;
+        fb.mHasBoundVertexShader = false;
+        fb.mHasBoundFragShader = false;
+        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+            fb.mLastBoundTextures[i] = nullptr;
+            fb.mLastBoundSamplers[i] = nullptr;
+        }
+        memset(fb.mViewport, 0, sizeof(MTL::Viewport));
+        memset(fb.mScissorRect, 0, sizeof(MTL::ScissorRect));
+        fb.mLastDepthTest = -1;
+        fb.mLastDepthMask = -1;
+        fb.mLastZmodeDecal = -1;
+        it = mDrawnFramebuffers.erase(it);
+    }
+}
+
 void GfxRenderingAPIMetal::EndFrame() {
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;
