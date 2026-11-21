@@ -7292,7 +7292,13 @@ void Interpreter::Interp2DPrepare(Gfx* commands) {
     sRectMove.clear();
     sRectMoving.clear();
     static const bool sOff = getenv("PORT_INTERP_2D") != nullptr && atoi(getenv("PORT_INTERP_2D")) == 0;
-    if (sOff || sRectLast.empty()) return;
+    // The reference is the last exact drawing. Its rectangles move from sRectRec to sRectLast only when the next
+    // drawing starts (Run), and this comes before it: after an exact drawing they are still in sRectRec. Pairing with
+    // sRectLast paired a frame with the exact drawing before the last one, two game frames back: a panel that had just
+    // come to rest moved back by half its last step in the in-between picture (the Free Battle box bar jumped down
+    // 23 pixels for one picture after sliding in, a flicker between two still frames).
+    const Interp2DRects& last = sRectLastRunExact ? sRectRec : sRectLast;
+    if (sOff || last.empty()) return;
     // the frame's rectangles: a walk like TrackSegmentsOnly's (texture state through the normal handlers), state
     // restored afterwards
     RSP savedRsp = *mRsp;
@@ -7391,8 +7397,8 @@ void Interpreter::Interp2DPrepare(Gfx* commands) {
     std::map<std::pair<int32_t, int32_t>, int> votes;
     std::set<std::pair<int32_t, int32_t>> uniqueMoves;
     for (auto& [key, cv] : cur) {
-        auto lit = sRectLast.find(key);
-        if (lit == sRectLast.end()) continue;
+        auto lit = last.find(key);
+        if (lit == last.end()) continue;
         Side& c = curSide[key];
         Side& l = lastSide[key];
         c.pos = cv;
