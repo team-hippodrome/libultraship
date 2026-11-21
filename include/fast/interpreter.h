@@ -430,6 +430,10 @@ class Interpreter {
     // PORT: frame interpolation (src/port/interp.cpp). True when the frame paints the whole screen (a full-screen fill
     // rectangle into a frame buffer), so drawing it again shows the same picture whatever the frame buffer held before.
     bool FrameRepaintsScreen(Gfx* commands);
+    bool FrameRepaintsScreenWalk(Gfx* commands);
+    // PORT: after Interp2DPrepare: a frame that repaints through its opaque rectangles has one of them moving in the
+    // in-between pictures (interp.cpp then draws it from a copy of the previous picture)
+    bool RepaintCoverageMoves() const;
     // PORT: set while a display list is drawn again for an in-between frame: nothing is written back to game memory
     // (render-target readback) and the frame-buffer draw stamps (CPU-drawn frame detection) stay as they are.
     bool mReplayPass = false;

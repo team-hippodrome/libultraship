@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -4279,6 +4280,11 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 // a panel) or at least 4 rectangles moving alike; moves of more than 48 pixels (a cut, a jump) and new rectangles are
 // not blended. In-between drawings then place each rectangle between its old and new place.
 static std::unordered_map<Interp2DKey, std::vector<std::pair<int32_t, int32_t>>, Interp2DKeyHash> sRectMove;
+// PORT: the rectangles Interp2DPrepare found moving (x0, y0, x1, y1 as in the display list, 10.2), and the opaque
+// rectangles a frame's screen coverage came from (FrameRepaintsScreen; sRepaintByCoverage: that, not a fill, made it
+// count): RepaintCoverageMoves
+static std::vector<std::array<int32_t, 4>> sRectMoving, sRepaintRects;
+static bool sRepaintByCoverage = false;
 static void Interp2DPlaceImpl(float t, const Interp2DKey& key, int32_t& ulx, int32_t& uly, int32_t& lrx, int32_t& lry) {
     static const bool sOff = getenv("PORT_INTERP_2D") != nullptr && atoi(getenv("PORT_INTERP_2D")) == 0;
     if (sOff) return;
@@ -7284,6 +7290,7 @@ std::list<TmemRegion> CopyTmem(const std::list<TmemRegion>& from, RDP& rdp) {
 
 void Interpreter::Interp2DPrepare(Gfx* commands) {
     sRectMove.clear();
+    sRectMoving.clear();
     static const bool sOff = getenv("PORT_INTERP_2D") != nullptr && atoi(getenv("PORT_INTERP_2D")) == 0;
     if (sOff || sRectLast.empty()) return;
     // the frame's rectangles: a walk like TrackSegmentsOnly's (texture state through the normal handlers), state
@@ -7471,6 +7478,29 @@ void Interpreter::Interp2DPrepare(Gfx* commands) {
             }
         }
     }
+    for (const auto& b : boxes) {
+        if (b.moving) {
+            sRectMoving.push_back({ b.x0, b.y0, b.x1, b.y1 });
+        }
+    }
+}
+
+// PORT: a frame that repaints the screen only through the union of its opaque rectangles (FrameRepaintsScreen) relies
+// on those rectangles being where they are in every picture. When one of them moves in the in-between pictures
+// (Interp2DPrepare must have run for the frame), its old place is not painted there: the frame is drawn from a copy of
+// the previous picture after all.
+bool Interpreter::RepaintCoverageMoves() const {
+    if (!sRepaintByCoverage) {
+        return false;
+    }
+    for (const auto& m : sRectMoving) {
+        for (const auto& c : sRepaintRects) {
+            if (m == c) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool Interpreter::CanRestorePicture() const {
@@ -7527,7 +7557,62 @@ void Interpreter::ReplayEnd() {
     sReplayRestore = false;
 }
 
+// PORT: whether a rectangle drawn in these modes replaces the pixels under it (FrameRepaintsScreen). Mirrors the
+// renderer's blending decision (GfxSpTri1: use_alpha, alpha threshold, invisible draws, texture edge): a rectangle
+// counts only when the shader neither blends with the frame buffer nor discards texels, and no depth test can reject it.
+static bool RectReplacesPixels(uint32_t oml) {
+    // (whatever the cycle type: the renderer derives blending from the blender bits in every mode, fill included)
+    if ((oml & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_NONE) { // threshold or dither: texels are discarded
+        return false;
+    }
+    if ((oml & (Z_CMP | CVG_X_ALPHA)) != 0) {
+        return false;
+    }
+    const bool blends = ((oml & (3 << 20)) == (G_BL_CLR_MEM << 20) && (oml & (3 << 16)) == (G_BL_1MA << 16)) ||
+                        ((oml & (3 << 22)) == (G_BL_CLR_MEM << 22) && (oml & (3 << 18)) == (G_BL_1MA << 18));
+    const bool invisible = (oml & (3 << 24)) == (G_BL_0 << 24) && (oml & (3 << 20)) == (G_BL_CLR_MEM << 20);
+    return !blends && !invisible;
+}
+
+// PORT: whether a texture address lies in one of the game's main colour images (FrameRepaintsScreen): a frame that
+// samples one copies a picture, the previous one for a frame drawn over itself, which repainting would replace with
+// the previous in-between picture. Render targets do not count: in-between pictures draw nothing into them, so they
+// hold the exact frame's drawing either way (the main menu's preview panel is one).
+static bool TextureIsMainFrameBuffer(uintptr_t addr) {
+    for (const auto& [base, fb] : sMainFbs) {
+        if (addr >= base && addr < base + 640 * 480 * 2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool TraceRepaint() {
+    static const bool on = getenv("PORT_TRACE_REPAINT") != nullptr;
+    return on;
+}
+
+// The same display list is asked about for each of its drawings (interp.cpp once per game frame, Run's edge band clear
+// for the first picture and every in-between one); they all start from the same RDP state.
 bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
+    static Gfx* sLastCommands = nullptr;
+    static uint64_t sLastTick = 0;
+    static uint32_t sLastOml = 0, sLastOmh = 0;
+    static bool sLastResult = false;
+    const uint64_t tick = Port_ViTick();
+    if (commands == sLastCommands && tick == sLastTick && mRdp->other_mode_l == sLastOml &&
+        mRdp->other_mode_h == sLastOmh && !TraceRepaint()) {
+        return sLastResult;
+    }
+    sLastResult = FrameRepaintsScreenWalk(commands);
+    sLastCommands = commands;
+    sLastTick = tick;
+    sLastOml = mRdp->other_mode_l;
+    sLastOmh = mRdp->other_mode_h;
+    return sLastResult;
+}
+
+bool Interpreter::FrameRepaintsScreenWalk(Gfx* commands) {
     // Same walk as TrackSegmentsOnly, read-only: the segment table is restored afterwards.
     uintptr_t savedSegments[MAX_SEGMENT_POINTERS];
     memcpy(savedSegments, mSegmentPointers, sizeof(savedSegments));
@@ -7536,7 +7621,47 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
     uintptr_t cimg = 0, zimg = 0;
     uint32_t cimgWidth = 320;
     bool offscreen = false, fullFill = false;
-    uint32_t otherModeH = 0; // cycle type: a fill rectangle in 1/2-cycle mode can be translucent (a fade)
+    // cycle type: a fill rectangle in 1/2-cycle mode can be translucent (a fade). The walk starts from the modes the
+    // frame starts with (they persist from frame to frame).
+    uint32_t otherModeH = mRdp->other_mode_h, otherModeL = mRdp->other_mode_l;
+    // PORT: a frame also repaints the screen when opaque rectangles (RectReplacesPixels) together cover all of it: the
+    // menus draw their background as rows of textured tiles, not as a fill. A pixel that some opaque rectangle wrote
+    // does not depend on what the frame buffer held before, whatever is blended over it afterwards; so the union of
+    // the opaque rectangles, each clipped to its scissor, must be the whole screen. Triangles are not counted. The
+    // scissor is unknown until the frame sets one (rectangles before that do not count).
+    static std::vector<uint8_t> sCovered;
+    uintptr_t coverImg = 0;
+    uint32_t coverW = 0, coverH = 0;
+    int32_t scUlx = 0, scUly = 0, scLrx = 0, scLry = 0; // 10.2 fixed point, lower right exclusive
+    int opaqueRects = 0;
+    uintptr_t timg = 0;
+    bool fbTexture = false; // a texture was loaded from a main frame buffer (TextureIsMainFrameBuffer)
+    bool customOp = false; // an OTR opcode ends the walk early: what follows is not seen
+    std::vector<std::array<int32_t, 4>> contributing;
+    // raw: the rectangle as the display list gives it (10.2; Interp2DPrepare's coordinates), inclusive: copy and fill
+    // mode cover the lower right edge too (the renderer adds a pixel after dropping empty rectangles)
+    auto cover = [&](int32_t rulx, int32_t ruly, int32_t rlrx, int32_t rlry, int32_t inclusive) {
+        if (rlrx <= rulx || rlry <= ruly) {
+            return;
+        }
+        int32_t ulx = std::max(rulx, scUlx), uly = std::max(ruly, scUly);
+        int32_t lrx = rlrx + inclusive, lry = rlry + inclusive;
+        uly = std::max(uly, scUly);
+        lrx = std::min(lrx, scLrx);
+        lry = std::min(lry, scLry);
+        const std::array<int32_t, 4> raw = { rulx, ruly, rlrx, rlry };
+        // whole pixels only: a pixel counts when the rectangle covers it entirely
+        const int32_t x0 = std::max<int32_t>(0, (ulx + 3) >> 2), y0 = std::max<int32_t>(0, (uly + 3) >> 2);
+        const int32_t x1 = std::min<int32_t>((int32_t)coverW, lrx >> 2), y1 = std::min<int32_t>((int32_t)coverH, lry >> 2);
+        if (x0 >= x1 || y0 >= y1 || fbTexture) {
+            return;
+        }
+        opaqueRects++;
+        contributing.push_back(raw);
+        for (int32_t y = y0; y < y1; y++) {
+            memset(&sCovered[(size_t)y * coverW + x0], 1, (size_t)(x1 - x0));
+        }
+    };
     for (int budget = 0; cmd != nullptr && budget < 400000; budget++) {
         if ((uintptr_t)cmd < 0x100000000ull) {
             break;
@@ -7545,6 +7670,7 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
         uintptr_t w1 = cmd->words.w1;
         uint8_t op = (uint8_t)(w0 >> 24);
         if (op == 0xDF /* G_ENDDL */ || (op > 0x07 && op < 0xD3)) {
+            customOp |= op != 0xDF;
             if (stack.empty()) {
                 break;
             }
@@ -7582,14 +7708,37 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
             cimg = (uintptr_t)SegAddr(w1);
             offscreen = (width != 320 && width != 640 && w1 != 0) || IsUnshownScreenImage(width, (const void*)cimg);
             cimgWidth = width;
+            if (!offscreen && cimg != coverImg) { // (coverage of the main picture the frame draws now)
+                coverImg = cimg;
+                coverW = width;
+                coverH = width > 400 ? 480 : 240;
+                sCovered.assign((size_t)coverW * coverH, 0);
+            }
         } else if (op == 0xFE /* G_SETZIMG */) {
             zimg = (uintptr_t)SegAddr(w1);
+        } else if (op == 0xFD /* G_SETTIMG */) {
+            timg = (uintptr_t)SegAddr(w1);
+        } else if (op == 0xF3 /* G_LOADBLOCK */ || op == 0xF4 /* G_LOADTILE */ || op == 0xF0 /* G_LOADTLUT */) {
+            if (!fbTexture && TextureIsMainFrameBuffer(timg)) {
+                fbTexture = true;
+                if (TraceRepaint()) fprintf(stderr, "[repaint]   texture from a main frame buffer %p\n", (void*)timg);
+            }
         } else if (op == 0xE3 /* G_SETOTHERMODE_H */) {
             uint32_t len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
             uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
             otherModeH = (otherModeH & ~mask) | ((uint32_t)w1 & mask);
+        } else if (op == 0xE2 /* G_SETOTHERMODE_L */) {
+            uint32_t len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
+            uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
+            otherModeL = (otherModeL & ~mask) | ((uint32_t)w1 & mask);
         } else if (op == 0xEF /* G_RDPSETOTHERMODE */) {
             otherModeH = w0 & 0xFFFFFF;
+            otherModeL = (uint32_t)w1;
+        } else if (op == 0xED /* G_SETSCISSOR */) {
+            scUlx = (int32_t)((w0 >> 12) & 0xFFF);
+            scUly = (int32_t)(w0 & 0xFFF);
+            scLrx = (int32_t)(((uint32_t)w1 >> 12) & 0xFFF);
+            scLry = (int32_t)((uint32_t)w1 & 0xFFF);
         } else if (op == 0xF6 /* G_FILLRECT */ && !offscreen && ((otherModeH >> G_MDSFT_CYCLETYPE) & 3) == 3) {
             uint32_t lrx = (w0 >> 14) & 0x3FF, lry = (w0 >> 2) & 0x3FF;
             uint32_t ulx = ((uint32_t)w1 >> 14) & 0x3FF, uly = ((uint32_t)w1 >> 2) & 0x3FF;
@@ -7597,11 +7746,47 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
             if (cimg != zimg && ulx == 0 && uly == 0 && lrx + 1 >= cimgWidth && lry + 1 >= h) {
                 fullFill = true;
             }
+            if (cimg == coverImg && cimg != zimg && RectReplacesPixels(otherModeL)) {
+                cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF), (int32_t)((w0 >> 12) & 0xFFF),
+                      (int32_t)(w0 & 0xFFF), 4);
+            }
+        } else if (op == 0xF6 /* G_FILLRECT, 1/2-cycle */ && !offscreen && cimg == coverImg && cimg != zimg &&
+                   RectReplacesPixels(otherModeL)) {
+            cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF), (int32_t)((w0 >> 12) & 0xFFF),
+                  (int32_t)(w0 & 0xFFF), 0);
+        } else if (op == 0xE4 /* G_TEXRECT */ || op == 0xE5 /* G_TEXRECTFLIP */) {
+            // (two more words: texture coordinates and steps)
+            if (!offscreen && cimg == coverImg && cimg != zimg && RectReplacesPixels(otherModeL)) {
+                const uint32_t cycle = otherModeH & (3U << G_MDSFT_CYCLETYPE);
+                if (cycle != G_CYC_FILL) { // (a texture rectangle in fill mode is meaningless: not counted)
+                    cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF), (int32_t)((w0 >> 12) & 0xFFF),
+                          (int32_t)(w0 & 0xFFF), cycle == G_CYC_COPY ? 4 : 0);
+                }
+            }
+            cmd += 2;
         }
         cmd++;
     }
     memcpy(mSegmentPointers, savedSegments, sizeof(savedSegments));
-    return fullFill;
+    // (a frame buffer read anywhere in the frame, or a part of it not seen, and the coverage proves nothing: a copy of
+    // the previous picture drawn after the background would show the previous in-between one)
+    const bool covered = coverImg != 0 && !fbTexture && !customOp && memchr(sCovered.data(), 0, sCovered.size()) == nullptr;
+    sRepaintByCoverage = covered && !fullFill;
+    sRepaintRects = std::move(contributing);
+    if (TraceRepaint()) {
+        int x0 = (int)coverW, y0 = (int)coverH, x1 = -1, y1 = -1;
+        for (uint32_t y = 0; y < coverH; y++) {
+            for (uint32_t x = 0; x < coverW; x++) {
+                if (!sCovered[(size_t)y * coverW + x]) {
+                    x0 = std::min(x0, (int)x), y0 = std::min(y0, (int)y), x1 = std::max(x1, (int)x), y1 = std::max(y1, (int)y);
+                }
+            }
+        }
+        fprintf(stderr, "[repaint] fill %d covered %d: %d opaque rects on %ux%u, uncovered (%d,%d)-(%d,%d)%s%s\n",
+                (int)fullFill, (int)covered, opaqueRects, coverW, coverH, x0, y0, x1, y1,
+                fbTexture ? ", main frame buffer texture" : "", customOp ? ", OTR opcode" : "");
+    }
+    return fullFill || covered;
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
