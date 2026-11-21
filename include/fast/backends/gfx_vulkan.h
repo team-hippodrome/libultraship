@@ -189,6 +189,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     void OnResize() override;
     void StartFrame() override;
     void EndFrame() override;
+    void SubmitRecorded() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
@@ -226,6 +227,9 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     struct FrameSlot {
         VkFence fence = VK_NULL_HANDLE;
         bool fenceInFlight = false;
+        // PORT: SubmitRecorded's submission (waited for with the frame's own before the slot is reused)
+        VkFence earlyFence = VK_NULL_HANDLE;
+        bool earlyFenceInFlight = false;
         VkCommandPool commandPool = VK_NULL_HANDLE;
         // PORT: the command buffers allocated from commandPool. vkResetCommandPool (NewFrame) only resets them, so
         // they are handed out again frame after frame; allocating new ones every frame grew the pool without end

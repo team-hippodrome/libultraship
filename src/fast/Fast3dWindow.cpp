@@ -342,6 +342,8 @@ bool Fast3dWindow::RunCommandsIntoNextPicture(Gfx* commands, const std::unordere
     mInterpreter->mRunNotLast = true;
     mInterpreter->Run(commands, mtxReplacements);
     mInterpreter->mRunNotLast = false;
+    // (to the GPU before the next display list records anything: see SubmitRecorded)
+    mRenderingApi->SubmitRecorded();
     return true;
 }
 

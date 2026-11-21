@@ -70,6 +70,12 @@ class GfxRenderingAPI {
     virtual void OnResize() = 0;
     virtual void StartFrame() = 0;
     virtual void EndFrame() = 0;
+    // PORT: hands the GPU what the frame buffers recorded so far in this frame, without presenting (several display
+    // lists in one picture: Fast3dWindow::RunCommandsIntoNextPicture). Backends that record one command buffer per frame
+    // buffer submit them in frame buffer order at the end of the frame, not in drawing order: a later display list's
+    // copy out of a frame buffer would run before an earlier one's drawing into it. Immediate APIs need nothing.
+    virtual void SubmitRecorded() {
+    }
     virtual void FinishRender() = 0;
     virtual int CreateFramebuffer() = 0;
     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,

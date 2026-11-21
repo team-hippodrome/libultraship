@@ -1149,6 +1149,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
 
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &slot.fence));
+        VK_CHECK(vkCreateFence(mDevice, &fci, nullptr, &slot.earlyFence));
         VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         VK_CHECK(vkCreateSemaphore(mDevice, &sci, nullptr, &slot.imageAvailable));
         VK_CHECK(vkCreateSemaphore(mDevice, &sci, nullptr, &slot.renderFinished));
@@ -1605,6 +1606,11 @@ void GfxRenderingAPIVK::NewFrame() {
         VK_CHECK(vkResetFences(mDevice, 1, &slot.fence));
         slot.fenceInFlight = false;
         sStat.fenceMs += MsSince(statStart);
+    }
+    if (slot.earlyFenceInFlight) { // (submitted before the frame's own: done by now, but the spec wants a wait)
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+        slot.earlyFenceInFlight = false;
     }
     CollectGarbage(slot);
     VK_CHECK(vkResetCommandPool(mDevice, slot.commandPool, 0));
@@ -3014,6 +3020,48 @@ GfxRenderingAPIVK::GetPixelDepth(int fbId, const std::set<std::pair<float, float
         StartDrawToFramebuffer(fbId, 0.0f);
     }
     return res;
+}
+
+// The uploads and the game frame buffers' command buffers recorded so far go to the queue now, in the order EndFrame
+// would use; the frame buffers start new ones when drawn again. The screen's (0) stays for EndFrame, which presents.
+void GfxRenderingAPIVK::SubmitRecorded() {
+    if (!mFrameActive) {
+        return;
+    }
+    std::vector<VkCommandBuffer> cmds;
+    if (mUploadCmd != VK_NULL_HANDLE) {
+        VK_CHECK(vkEndCommandBuffer(mUploadCmd));
+        cmds.push_back(mUploadCmd);
+        mUploadCmd = VK_NULL_HANDLE; // (the staging offset goes on: the data stays until the frame is done)
+    }
+    std::sort(mDrawnFramebuffers.begin(), mDrawnFramebuffers.end());
+    std::vector<int> keep;
+    for (int fbId : mDrawnFramebuffers) {
+        FramebufferVK& fb = mFramebuffers[fbId];
+        if (fbId == 0 || fb.mCommandBuffer == VK_NULL_HANDLE) {
+            keep.push_back(fbId);
+            continue;
+        }
+        EndPass(fb);
+        VK_CHECK(vkEndCommandBuffer(fb.mCommandBuffer));
+        cmds.push_back(fb.mCommandBuffer);
+        fb.mCommandBuffer = VK_NULL_HANDLE;
+        fb.mPassActive = false;
+    }
+    mDrawnFramebuffers = std::move(keep);
+    if (cmds.empty()) {
+        return;
+    }
+    FrameSlot& slot = mFrames[mFrameSlot];
+    if (slot.earlyFenceInFlight) { // (one at a time per frame slot)
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+    }
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = (uint32_t)cmds.size();
+    si.pCommandBuffers = cmds.data();
+    VK_CHECK(vkQueueSubmit(mQueue, 1, &si, slot.earlyFence));
+    slot.earlyFenceInFlight = true;
 }
 
 void GfxRenderingAPIVK::EndFrame() {
