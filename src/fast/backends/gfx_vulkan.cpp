@@ -2858,6 +2858,13 @@ void GfxRenderingAPIVK::SubmitFramebufferAndWait(int fbId) {
     VK_CHECK(vkQueueSubmit(mQueue, 1, &si, mReadbackFence));
     VK_CHECK(vkWaitForFences(mDevice, 1, &mReadbackFence, VK_TRUE, UINT64_MAX));
     VK_CHECK(vkResetFences(mDevice, 1, &mReadbackFence));
+    // (the staging buffer is reused from the start: uploads SubmitRecorded handed over earlier must be done too)
+    FrameSlot& slot = mFrames[mFrameSlot];
+    if (slot.earlyFenceInFlight) {
+        VK_CHECK(vkWaitForFences(mDevice, 1, &slot.earlyFence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(mDevice, 1, &slot.earlyFence));
+        slot.earlyFenceInFlight = false;
+    }
     sStat.syncSubmits++;
     sStat.syncMs += MsSince(statStart);
 
