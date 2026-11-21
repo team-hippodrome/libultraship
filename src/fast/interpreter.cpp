@@ -427,6 +427,13 @@ static bool IsFrameBufferSelfCopy(const Fast::RDP* rdp, uint8_t tile, int32_t ul
 static bool sPendingOffscreenPreserve = false;
 static uint32_t sPendingOffscreenWidth = 0;
 static bool sInOffscreen = false;
+// An in-between picture of frame interpolation (mReplayPass) draws the frame's display list again later, while
+// the game is already building its next frame. Render targets are pictures in the game's memory: they keep what the
+// frame drew into them, so a replay draws nothing into them (sReplaySkipTarget: its drawing is dropped, its state
+// changes still happen). Drawn again, they used whatever the game had put in that memory since: the order screen's
+// Pokémon icons are drawn one a frame from one model buffer, and the replay drew an icon with the next Pokémon's
+// model (Nidoking scrambled, Nidoqueen in Pikachu's colours).
+static bool sReplaySkipTarget = false;
 static uintptr_t sCurOffscreenAddr = 0; // RDRAM address of the render target being drawn
 // PORT: one persistent GPU framebuffer per N64 frame buffer (colour image address). The N64 rotates two or three frame
 // buffers that keep their picture, and games update them incrementally (erasing what they drew into the same buffer
@@ -716,6 +723,11 @@ void UploadTimed(Fast::GfxRenderingAPI* api, const uint8_t* pixels, uint32_t wid
 } // namespace
 
 void Interpreter::Flush() {
+    if (mBufVboLen > 0 && sReplaySkipTarget) { // (see sReplaySkipTarget)
+        mBufVboLen = 0;
+        mBufVboNumTris = 0;
+        return;
+    }
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         {
@@ -4531,6 +4543,9 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
 }
 
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+    if (sReplaySkipTarget) { // a render target in an in-between picture: nothing is drawn into it
+        return;
+    }
     if (!mFbActive && mRdp->color_image_address != mRdp->z_buf_address) { // PORT: 2D in-between frames (mReplayT)
         Interp2DPlaceImpl(mReplayT, { nullptr, lrx - ulx, lry - uly,
                         (uint32_t)mRdp->fill_color.r << 24 | mRdp->fill_color.g << 16 | mRdp->fill_color.b << 8 |
@@ -4688,6 +4703,29 @@ void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t wi
     bool offscreen = pixelWidth != 320 && pixelWidth != 640 && address != nullptr && !PortNoRtt();
     if (!offscreen && IsUnshownScreenImage(pixelWidth, address)) {
         offscreen = true;
+    }
+    Flush(); // (what was drawn before goes where it belongs, then sReplaySkipTarget follows the new colour image)
+    sReplaySkipTarget = offscreen && mReplayPass;
+    if (sReplaySkipTarget) {
+        // A target the first drawing created or drew into stays bound as it was then: the same state for the rest of
+        // the list. One missing now (forgotten since) is not created again: its drawing is dropped either way.
+        auto it = sOffscreenFbs.find((uintptr_t)address);
+        sPendingOffscreenAddr = 0;
+        if (it != sOffscreenFbs.end()) {
+            SetFrameBuffer(it->second.fb, 1.0f);
+            mActiveFrameBuffer = mFrameBuffers.find(it->second.fb);
+            mFbActive = true;
+            sInOffscreen = true;
+            sCurOffscreenAddr = (uintptr_t)address;
+            mRdp->viewport_or_scissor_changed = true;
+            mRenderingState.viewport = {};
+            mRenderingState.scissor = {};
+        }
+        if (pixelWidth > 400 && !PortFixedNativeW()) {
+            mNativeDimensions.width = 640;
+            mNativeDimensions.height = 480;
+        }
+        return;
     }
     if (offscreen) {
         Flush();
@@ -7667,6 +7705,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+    sReplaySkipTarget = false; // (a list that ends inside a render target)
     RttFinishReadbacks(); // before the frame's task completes and the game can read the buffers
     if (traceTiming) {
         const auto setupMs = std::chrono::duration<double, std::milli>(listStart - runStart).count();
