@@ -7527,7 +7527,69 @@ void Interpreter::ReplayEnd() {
     sReplayRestore = false;
 }
 
+// PORT: whether a rectangle drawn in these modes replaces the pixels under it (FrameRepaintsScreen). Mirrors the
+// renderer's blending decision (GfxSpTri1: use_alpha, alpha threshold, invisible draws, texture edge): a rectangle
+// counts only when the shader neither blends with the frame buffer nor discards texels, and no depth test can reject it.
+static bool RectReplacesPixels(uint32_t oml, uint32_t omh) {
+    const uint32_t cycle = omh & (3U << G_MDSFT_CYCLETYPE);
+    if (cycle == G_CYC_FILL) {
+        return true;
+    }
+    if ((oml & (3U << G_MDSFT_ALPHACOMPARE)) != G_AC_NONE) { // threshold or dither: texels are discarded
+        return false;
+    }
+    if ((oml & (Z_CMP | CVG_X_ALPHA)) != 0) {
+        return false;
+    }
+    const bool blends = ((oml & (3 << 20)) == (G_BL_CLR_MEM << 20) && (oml & (3 << 16)) == (G_BL_1MA << 16)) ||
+                        ((oml & (3 << 22)) == (G_BL_CLR_MEM << 22) && (oml & (3 << 18)) == (G_BL_1MA << 18));
+    const bool invisible = (oml & (3 << 24)) == (G_BL_0 << 24) && (oml & (3 << 20)) == (G_BL_CLR_MEM << 20);
+    return !blends && !invisible;
+}
+
+// PORT: whether a texture address lies in a frame buffer: one of the game's main colour images or a render target.
+// A rectangle textured from one copies a picture (the previous one, for a frame drawn over itself), so it does not
+// make the frame independent of what the frame buffers held (FrameRepaintsScreen).
+static bool TextureIsFrameBuffer(uintptr_t addr) {
+    for (const auto& [base, fb] : sMainFbs) {
+        if (addr >= base && addr < base + 640 * 480 * 2) {
+            return true;
+        }
+    }
+    for (const auto& [base, info] : sOffscreenFbs) {
+        if (addr >= base && addr < base + (uintptr_t)info.w * info.h * 2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool TraceRepaint() {
+    static const bool on = getenv("PORT_TRACE_REPAINT") != nullptr;
+    return on;
+}
+
+// The same display list is asked about for each of its drawings (interp.cpp once per game frame, Run's edge band clear
+// for the first picture and every in-between one); they all start from the same RDP state.
 bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
+    static Gfx* sLastCommands = nullptr;
+    static uint64_t sLastTick = 0;
+    static uint32_t sLastOml = 0, sLastOmh = 0;
+    static bool sLastResult = false;
+    const uint64_t tick = Port_ViTick();
+    if (commands == sLastCommands && tick == sLastTick && mRdp->other_mode_l == sLastOml &&
+        mRdp->other_mode_h == sLastOmh && !TraceRepaint()) {
+        return sLastResult;
+    }
+    sLastResult = FrameRepaintsScreenWalk(commands);
+    sLastCommands = commands;
+    sLastTick = tick;
+    sLastOml = mRdp->other_mode_l;
+    sLastOmh = mRdp->other_mode_h;
+    return sLastResult;
+}
+
+bool Interpreter::FrameRepaintsScreenWalk(Gfx* commands) {
     // Same walk as TrackSegmentsOnly, read-only: the segment table is restored afterwards.
     uintptr_t savedSegments[MAX_SEGMENT_POINTERS];
     memcpy(savedSegments, mSegmentPointers, sizeof(savedSegments));
@@ -7536,7 +7598,37 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
     uintptr_t cimg = 0, zimg = 0;
     uint32_t cimgWidth = 320;
     bool offscreen = false, fullFill = false;
-    uint32_t otherModeH = 0; // cycle type: a fill rectangle in 1/2-cycle mode can be translucent (a fade)
+    // cycle type: a fill rectangle in 1/2-cycle mode can be translucent (a fade). The walk starts from the modes the
+    // frame starts with (they persist from frame to frame).
+    uint32_t otherModeH = mRdp->other_mode_h, otherModeL = mRdp->other_mode_l;
+    // PORT: a frame also repaints the screen when opaque rectangles (RectReplacesPixels) together cover all of it: the
+    // menus draw their background as rows of textured tiles, not as a fill. A pixel that some opaque rectangle wrote
+    // does not depend on what the frame buffer held before, whatever is blended over it afterwards; so the union of
+    // the opaque rectangles, each clipped to its scissor, must be the whole screen. Triangles are not counted. The
+    // scissor is unknown until the frame sets one (rectangles before that do not count).
+    static std::vector<uint8_t> sCovered;
+    uintptr_t coverImg = 0;
+    uint32_t coverW = 0, coverH = 0;
+    int32_t scUlx = 0, scUly = 0, scLrx = 0, scLry = 0; // 10.2 fixed point, lower right exclusive
+    int opaqueRects = 0;
+    uintptr_t timg = 0;
+    bool fbTexture = false; // a texture was loaded from a frame buffer: no rectangle after that counts
+    auto cover = [&](int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) { // 10.2, lower right exclusive
+        ulx = std::max(ulx, scUlx);
+        uly = std::max(uly, scUly);
+        lrx = std::min(lrx, scLrx);
+        lry = std::min(lry, scLry);
+        // whole pixels only: a pixel counts when the rectangle covers it entirely
+        const int32_t x0 = std::max<int32_t>(0, (ulx + 3) >> 2), y0 = std::max<int32_t>(0, (uly + 3) >> 2);
+        const int32_t x1 = std::min<int32_t>((int32_t)coverW, lrx >> 2), y1 = std::min<int32_t>((int32_t)coverH, lry >> 2);
+        if (x0 >= x1 || y0 >= y1 || fbTexture) {
+            return;
+        }
+        opaqueRects++;
+        for (int32_t y = y0; y < y1; y++) {
+            memset(&sCovered[(size_t)y * coverW + x0], 1, (size_t)(x1 - x0));
+        }
+    };
     for (int budget = 0; cmd != nullptr && budget < 400000; budget++) {
         if ((uintptr_t)cmd < 0x100000000ull) {
             break;
@@ -7582,14 +7674,37 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
             cimg = (uintptr_t)SegAddr(w1);
             offscreen = (width != 320 && width != 640 && w1 != 0) || IsUnshownScreenImage(width, (const void*)cimg);
             cimgWidth = width;
+            if (!offscreen && cimg != coverImg) { // (coverage of the main picture the frame draws now)
+                coverImg = cimg;
+                coverW = width;
+                coverH = width > 400 ? 480 : 240;
+                sCovered.assign((size_t)coverW * coverH, 0);
+            }
         } else if (op == 0xFE /* G_SETZIMG */) {
             zimg = (uintptr_t)SegAddr(w1);
+        } else if (op == 0xFD /* G_SETTIMG */) {
+            timg = (uintptr_t)SegAddr(w1);
+        } else if (op == 0xF3 /* G_LOADBLOCK */ || op == 0xF4 /* G_LOADTILE */ || op == 0xF0 /* G_LOADTLUT */) {
+            if (!fbTexture && TextureIsFrameBuffer(timg)) {
+                fbTexture = true;
+                if (TraceRepaint()) fprintf(stderr, "[repaint]   texture from frame buffer %p\n", (void*)timg);
+            }
         } else if (op == 0xE3 /* G_SETOTHERMODE_H */) {
             uint32_t len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
             uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
             otherModeH = (otherModeH & ~mask) | ((uint32_t)w1 & mask);
+        } else if (op == 0xE2 /* G_SETOTHERMODE_L */) {
+            uint32_t len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
+            uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
+            otherModeL = (otherModeL & ~mask) | ((uint32_t)w1 & mask);
         } else if (op == 0xEF /* G_RDPSETOTHERMODE */) {
             otherModeH = w0 & 0xFFFFFF;
+            otherModeL = (uint32_t)w1;
+        } else if (op == 0xED /* G_SETSCISSOR */) {
+            scUlx = (int32_t)((w0 >> 12) & 0xFFF);
+            scUly = (int32_t)(w0 & 0xFFF);
+            scLrx = (int32_t)(((uint32_t)w1 >> 12) & 0xFFF);
+            scLry = (int32_t)((uint32_t)w1 & 0xFFF);
         } else if (op == 0xF6 /* G_FILLRECT */ && !offscreen && ((otherModeH >> G_MDSFT_CYCLETYPE) & 3) == 3) {
             uint32_t lrx = (w0 >> 14) & 0x3FF, lry = (w0 >> 2) & 0x3FF;
             uint32_t ulx = ((uint32_t)w1 >> 14) & 0x3FF, uly = ((uint32_t)w1 >> 2) & 0x3FF;
@@ -7597,11 +7712,40 @@ bool Interpreter::FrameRepaintsScreen(Gfx* commands) {
             if (cimg != zimg && ulx == 0 && uly == 0 && lrx + 1 >= cimgWidth && lry + 1 >= h) {
                 fullFill = true;
             }
+            if (cimg == coverImg && cimg != zimg) { // (fill mode includes the lower right edge)
+                cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF), (int32_t)((w0 >> 12) & 0xFFF) + 4,
+                      (int32_t)(w0 & 0xFFF) + 4);
+            }
+        } else if (op == 0xF6 /* G_FILLRECT, 1/2-cycle */ && !offscreen && cimg == coverImg && cimg != zimg &&
+                   RectReplacesPixels(otherModeL, otherModeH)) {
+            cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF), (int32_t)((w0 >> 12) & 0xFFF),
+                  (int32_t)(w0 & 0xFFF));
+        } else if (op == 0xE4 /* G_TEXRECT */ || op == 0xE5 /* G_TEXRECTFLIP */) {
+            // (two more words: texture coordinates and steps)
+            if (!offscreen && cimg == coverImg && cimg != zimg && RectReplacesPixels(otherModeL, otherModeH)) {
+                const int32_t inclusive = (otherModeH & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY ? 4 : 0;
+                cover((int32_t)((uint32_t)w1 >> 12 & 0xFFF), (int32_t)((uint32_t)w1 & 0xFFF),
+                      (int32_t)((w0 >> 12) & 0xFFF) + inclusive, (int32_t)(w0 & 0xFFF) + inclusive);
+            }
+            cmd += 2;
         }
         cmd++;
     }
     memcpy(mSegmentPointers, savedSegments, sizeof(savedSegments));
-    return fullFill;
+    const bool covered = coverImg != 0 && memchr(sCovered.data(), 0, sCovered.size()) == nullptr;
+    if (TraceRepaint()) {
+        int x0 = (int)coverW, y0 = (int)coverH, x1 = -1, y1 = -1;
+        for (uint32_t y = 0; y < coverH; y++) {
+            for (uint32_t x = 0; x < coverW; x++) {
+                if (!sCovered[(size_t)y * coverW + x]) {
+                    x0 = std::min(x0, (int)x), y0 = std::min(y0, (int)y), x1 = std::max(x1, (int)x), y1 = std::max(y1, (int)y);
+                }
+            }
+        }
+        fprintf(stderr, "[repaint] fill %d covered %d: %d opaque rects on %ux%u, uncovered (%d,%d)-(%d,%d)\n",
+                (int)fullFill, (int)covered, opaqueRects, coverW, coverH, x0, y0, x1, y1);
+    }
+    return fullFill || covered;
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
