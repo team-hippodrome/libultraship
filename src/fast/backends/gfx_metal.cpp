@@ -269,6 +269,24 @@ const char* GfxRenderingAPIMetal::GetName() {
     return "Metal";
 }
 
+GfxDeviceInfo GfxRenderingAPIMetal::GetDeviceInfo() {
+    GfxDeviceInfo info;
+    if (mDevice == nullptr) {
+        return info;
+    }
+    if (mDevice->name() != nullptr) {
+        info.name = mDevice->name()->utf8String();
+    }
+    info.unifiedMemory = mDevice->hasUnifiedMemory();
+    info.memoryBytes = mDevice->recommendedMaxWorkingSetSize();
+#if !TARGET_OS_IPHONE
+    // (Apple silicon reports neither: its GPU is integrated by design but in a class of its own)
+    info.integrated = mDevice->lowPower();
+    info.discrete = mDevice->removable() || (!info.unifiedMemory && !mDevice->lowPower());
+#endif
+    return info;
+}
+
 int GfxRenderingAPIMetal::GetMaxTextureSize() {
     return mDevice->supportsFamily(MTL::GPUFamilyApple3) ? 16384 : 8192;
 }

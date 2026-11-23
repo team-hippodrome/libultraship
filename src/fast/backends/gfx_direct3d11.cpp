@@ -145,6 +145,14 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
             if (SUCCEEDED(res2)) {
                 adapterName = adapterDesc.Description;
                 wcstombs(adapterNameCStr, adapterName.c_str(), 128);
+                // PORT: the adapter for GetDeviceInfo. Integrated graphics have (next to) no memory of their own and
+                // use shared system memory.
+                self->mDeviceInfo.name = adapterNameCStr;
+                self->mDeviceInfo.vendorId = adapterDesc.VendorId;
+                const uint64_t dedicated = adapterDesc.DedicatedVideoMemory;
+                self->mDeviceInfo.discrete = dedicated >= 512ull * 1024 * 1024;
+                self->mDeviceInfo.integrated = !self->mDeviceInfo.discrete;
+                self->mDeviceInfo.memoryBytes = self->mDeviceInfo.discrete ? dedicated : adapterDesc.SharedSystemMemory;
             }
             Adapter->Release();
         }
@@ -376,6 +384,10 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
 
 int GfxRenderingAPIDX11::GetMaxTextureSize() {
     return D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+}
+
+GfxDeviceInfo GfxRenderingAPIDX11::GetDeviceInfo() {
+    return mDeviceInfo;
 }
 
 const char* GfxRenderingAPIDX11::GetName() {

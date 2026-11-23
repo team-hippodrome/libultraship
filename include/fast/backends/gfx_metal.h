@@ -174,6 +174,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     /** @name GfxRenderingAPI implementation */
     /** @{ */
     const char* GetName() override;
+    GfxDeviceInfo GetDeviceInfo() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
     void UnloadShader(ShaderProgram* oldPrg) override;

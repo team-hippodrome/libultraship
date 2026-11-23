@@ -46,6 +46,32 @@ int GfxRenderingAPIOGL::GetMaxTextureSize() {
     return max_texture_size;
 }
 
+GfxDeviceInfo GfxRenderingAPIOGL::GetDeviceInfo() {
+    GfxDeviceInfo info;
+    const GLubyte* renderer = glGetString(GL_RENDERER);
+    const GLubyte* vendor = glGetString(GL_VENDOR);
+    info.name = renderer ? reinterpret_cast<const char*>(renderer) : "";
+    info.vendor = vendor ? reinterpret_cast<const char*>(vendor) : "";
+#ifndef USE_OPENGLES
+    // video memory where the driver offers it (NVIDIA: GL_NVX_gpu_memory_info; AMD: GL_ATI_meminfo), in KiB
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    GLint kib[4] = { 0, 0, 0, 0 };
+    glGetIntegerv(0x9047 /* GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX */, kib);
+    if (glGetError() == GL_NO_ERROR && kib[0] > 0) {
+        info.memoryBytes = (uint64_t)kib[0] * 1024;
+        info.discrete = true;
+    } else {
+        kib[0] = 0;
+        glGetIntegerv(0x87FC /* GL_TEXTURE_FREE_MEMORY_ATI */, kib);
+        if (glGetError() == GL_NO_ERROR && kib[0] > 0) {
+            info.memoryBytes = (uint64_t)kib[0] * 1024; // (free, not total: a lower bound)
+        }
+    }
+#endif
+    return info;
+}
+
 const char* GfxRenderingAPIOGL::GetName() {
     return "OpenGL";
 }

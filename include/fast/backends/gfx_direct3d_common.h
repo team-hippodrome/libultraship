@@ -118,6 +118,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     /** @name GfxRenderingAPI implementation */
     /** @{ */
     const char* GetName() override;
+    GfxDeviceInfo GetDeviceInfo() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
     void UnloadShader(struct ShaderProgram* oldPrg) override;
@@ -171,6 +172,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Device> mDevice;
     GfxWindowBackendDXGI* mWindowBackend = nullptr;
     D3D_FEATURE_LEVEL mFeatureLevel = {};
+    GfxDeviceInfo mDeviceInfo; // PORT: filled from the adapter when the device is created
 
     std::shared_ptr<Ship::ConsoleVariable> mConsoleVariable;
     std::shared_ptr<Ship::ResourceManager> mResourceManager;

@@ -1701,6 +1701,28 @@ void GfxRenderingAPIVK::RenderDrawData(ImDrawData* drawData) {
 
 // MARK: - GfxRenderingAPI implementation
 
+GfxDeviceInfo GfxRenderingAPIVK::GetDeviceInfo() {
+    GfxDeviceInfo info;
+    if (mPhysicalDevice == VK_NULL_HANDLE) {
+        return info;
+    }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(mPhysicalDevice, &props);
+    info.name = props.deviceName;
+    info.vendorId = props.vendorID;
+    info.integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                      props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    info.discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mem);
+    for (uint32_t i = 0; i < mem.memoryHeapCount; i++) { // the largest device-local heap
+        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mem.memoryHeaps[i].size > info.memoryBytes) {
+            info.memoryBytes = mem.memoryHeaps[i].size;
+        }
+    }
+    return info;
+}
+
 const char* GfxRenderingAPIVK::GetName() {
     return "Vulkan";
 }
