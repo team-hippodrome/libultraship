@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include <string>
 #include <unordered_map>
 #include <set>
 #include <string>
@@ -30,6 +31,18 @@ struct hash_pair_ff {
     }
 };
 
+// PORT: what the backend knows about the graphics chip it draws with (GfxRenderingAPI::GetDeviceInfo), for choosing
+// settings that suit it. Raw facts only; zero/empty when the API does not say.
+struct GfxDeviceInfo {
+    std::string name;          // adapter / renderer name as the API reports it ("Apple M2", "Intel(R) UHD Graphics 620")
+    std::string vendor;        // OpenGL's GL_VENDOR; empty elsewhere
+    uint32_t vendorId = 0;     // PCI vendor id (D3D, Vulkan): 0x8086 Intel, 0x1002 AMD, 0x10DE NVIDIA
+    bool integrated = false;   // shares system memory with the CPU (Vulkan type, D3D without dedicated memory, Metal low power)
+    bool discrete = false;     // a graphics card of its own (Vulkan type, D3D dedicated memory, Metal removable/high power)
+    bool unifiedMemory = false; // Metal: CPU and GPU share memory (Apple silicon, Intel graphics)
+    uint64_t memoryBytes = 0;  // memory the chip can use well (Metal's recommended working set, dedicated VRAM, ...)
+};
+
 // PORT: the default BeginReadFramebuffer's token (GfxRenderingAPI::FinishReadFramebuffer)
 struct DeferredRead {
     int fbId;
@@ -40,6 +53,10 @@ class GfxRenderingAPI {
   public:
     virtual ~GfxRenderingAPI() = default;
     virtual const char* GetName() = 0;
+    // PORT: the graphics chip (see GfxDeviceInfo); valid after Init
+    virtual GfxDeviceInfo GetDeviceInfo() {
+        return {};
+    }
     virtual int GetMaxTextureSize() = 0;
     virtual GfxClipParameters GetClipParameters() = 0;
     virtual void UnloadShader(ShaderProgram* oldPrg) = 0;

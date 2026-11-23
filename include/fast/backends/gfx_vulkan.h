@@ -164,6 +164,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
                       std::shared_ptr<Ship::ResourceManager> resourceManager = nullptr);
     ~GfxRenderingAPIVK() override;
     const char* GetName() override;
+    GfxDeviceInfo GetDeviceInfo() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
     void UnloadShader(ShaderProgram* oldPrg) override;
